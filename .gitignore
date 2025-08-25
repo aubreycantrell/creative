@@ -1,9 +1,52 @@
-
+# --- OS junk ---
 .DS_Store
+Thumbs.db
+Icon?
+*.swp
+*.swo
 
+# --- Logs / data you don't want in git ---
+*.log
+logs/
 interactions.csv
+data/
 
+# --- Python backend (not needed for GitHub Pages) ---
+app.py
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.*
+
+# --- Frontend build tooling (if ever used locally) ---
+node_modules/
+dist/
+build/
+.cache/
+.tmp/
+npm-debug.log*
+yarn-*.log*
+pnpm-*.log*
+
+# --- Flask templates not used on Pages ---
+templates/
+
+# --- Generated images: keep the folder, ignore the files ---
 static/images/*
 !static/images/.gitkeep
 
-**/.DS_Store
+# --- Ignore any accidental Python files in assets ---
+assets/*.py
+
+# --- Keep these (do NOT ignore) ---
+!.nojekyll
+!index.html
+!assets/
+!assets/*.css
+!assets/*.js

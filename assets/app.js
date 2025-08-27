@@ -15,7 +15,7 @@ const downloadCsvBtn = document.getElementById("downloadCsvBtn");
 const statusEl = document.getElementById("status");
 const historyGrid = document.getElementById("historyGrid");
 const canvas = document.getElementById("canvas");
-const ctx = canvas.getContext("2d");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
 let srcImage = null;
 let lastAnalysis = null;
@@ -134,13 +134,222 @@ function topKEmptiest(masses,k=3){const flat=[];for(let i=0;i<masses.length;i++)
 function cellName(i,j){const names=[["top left","top center","top right"],["middle left","center","middle right"],["bottom left","bottom center","bottom right"]];return names[Math.max(0,Math.min(2,i))][Math.max(0,Math.min(2,j))];}
 
 /* ---------- recommendation logic ---------- */
-const LIB={ /* …same as yours… (unchanged) */ };
-function randomDirection(){return ["diagonally","vertically","horizontally"][Math.floor(Math.random()*3)];}
-function opposeCohesion(f){ /* …same as yours… (unchanged) */ }
+/* ---------- recommendation library ---------- */
+const LIB = {
+  "newsprint halftone dot field": {
+    type: "pattern",
+    fmt: where =>
+      `Lay a **newsprint halftone dot field** as a translucent sheet across the ${where}, letting dots clash with your smooth areas.`,
+    why: "Introduce mechanical texture to disrupt soft gradients / uniform fills."
+  },
+  "checkerboard strip": {
+    type: "pattern",
+    fmt: (where, dir) =>
+      `Tape a **thin checkerboard strip** running ${dir} through the ${where}, slightly misaligned.`,
+    why: "High-contrast, regular checkers oppose blended/low-contrast zones."
+  },
+  "CMY misregistration swatch": {
+    type: "pattern",
+    fmt: where =>
+      `Add a **CMY misregistration swatch** (cyan/magenta/yellow blocks) in the ${where}, offset 2–4px per channel.`,
+    why: "Printers’ marks add industrial color conflict against cohesive palettes."
+  },
+  "ransom-letter typography": {
+    type: "concept",
+    fmt: where =>
+      `Collage a **ransom-letter word** from mismatched magazines across the ${where}.`,
+    why: "Mixed fonts/forms fracture typographic cohesion and inject narrative tension."
+  },
+  "found map fragment": {
+    type: "concept",
+    fmt: where =>
+      `Glue a **small torn map fragment** into the ${where} with a hard edge crossing your calm area.`,
+    why: "Cartographic lines disrupt organic imagery; a ‘place’ reference counters abstraction."
+  },
+  "barcode/receipt sliver": {
+    type: "concept",
+    fmt: where =>
+      `Slip a **barcode or receipt sliver** into the ${where}, slightly tilted.`,
+    why: "Commodity marks oppose hand-made continuity and draw crisp verticals."
+  },
+  "torn paper diagonal": {
+    type: "occurrence",
+    fmt: where =>
+      `Tear a **paper diagonal** from corner to corner through the ${where}; let the deckle edge show.`,
+    why: "Jagged tear adds directional energy and interrupts symmetry."
+  },
+  "masking tape X": {
+    type: "occurrence",
+    fmt: where =>
+      `Place a **masking-tape X** over the ${where}; leave a slight shadow gap.`,
+    why: "Tape reads provisional; the X symbolically ‘cancels’ cohesion."
+  },
+  "photocopy overlay": {
+    type: "occurrence",
+    fmt: where =>
+      `Overlay a **high-contrast photocopy** rectangle in the ${where}, 5–10° rotated.`,
+    why: "Brittle, desaturated toner fights saturated blends; rotation breaks alignment."
+  }
+};
+
+function randomDirection() {
+  return ["diagonally", "vertically", "horizontally"][Math.floor(Math.random() * 3)];
+}
+
+/* ---------- recommendation logic ---------- */
+function opposeCohesion(features) {
+  if (!features) return { recs: [], reasons: [] };
+
+  const recs = [];
+  const reasons = [];
+
+  const temp = features.temperature;           // "warm" | "cool"
+  const cf   = features.colorfulness;          // number
+  const cont = features.contrast;              // number (0..~0.5)
+  const edges= features.edge_density;          // 0..1
+  const ent  = features.entropy;               // ~0..8
+  const region = features.suggested_region || "center";
+
+  // 1) Color temperature opposition
+  if (temp === "cool") {
+    const R = LIB["CMY misregistration swatch"];
+    recs.push(R.fmt(region));
+    reasons.push(
+      `Image skews cool; add warm-biased CMY blocks and misregistration to create chroma conflict near ${region}.`
+    );
+  } else {
+    const R = LIB["photocopy overlay"];
+    recs.push(R.fmt(region));
+    reasons.push(
+      `Image reads warm/saturated (colorfulness=${cf.toFixed(1)}); a desaturated photocopy slab opposes palette unity.`
+    );
+  }
+
+  // 2) Texture / edge presence
+  if (edges < 0.06) {
+    const R = LIB["newsprint halftone dot field"];
+    recs.push(R.fmt(region));
+    reasons.push(
+      `Edge density is low (${edges.toFixed(3)}); halftone dots add micro-structure and noise.`
+    );
+  } else {
+    const R = LIB["masking tape X"];
+    recs.push(R.fmt(region));
+    reasons.push(
+      `Edges already active (${edges.toFixed(3)}); a bold tape ‘X’ creates symbolic interruption instead.`
+    );
+  }
+
+  // 3) Contrast / complexity
+  if (cont < 0.12 || ent < 6.0) {
+    const R = LIB["checkerboard strip"];
+    recs.push(R.fmt(region, randomDirection()));
+    reasons.push(
+      `Contrast=${cont.toFixed(2)}, entropy=${ent.toFixed(2)}; a crisp checker strip injects periodic contrast.`
+    );
+  } else {
+    const R = LIB["ransom-letter typography"];
+    recs.push(R.fmt(region));
+    reasons.push(
+      `High image complexity (entropy=${ent.toFixed(2)}); mixed-letter typography shifts attention and breaks semantic cohesion.`
+    );
+  }
+
+  return { recs, reasons };
+}
 
 /* ---------- overlay drawing ---------- */
 function getOverlayKindFromRecs(recs=[]){const t=recs.join(" ").toLowerCase();if(t.includes("halftone"))return"halftone";if(t.includes("checker"))return"checker";if(t.includes("misregistration")||t.includes("cmy"))return"cmy";if(t.includes("masking-tape")||t.includes("tape x")||t.includes("masking"))return"tapex";if(t.includes("photocopy"))return"photocopy";return"checker";}
-function buildOverlayPatch(kind,w,h){ /* …same as yours… (unchanged) */ }
+function buildOverlayPatch(kind, w, h) {
+  const patch = document.createElement("canvas");
+  patch.width = w; patch.height = h;
+  const p = patch.getContext("2d");
+
+  if (kind === "checker") {
+    const cell = 12;
+    const img = p.createImageData(w, h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        const on = ((Math.floor(x / cell) ^ Math.floor(y / cell)) & 1) === 1;
+        const v = on ? 245 : 25;
+        img.data[i + 0] = v;
+        img.data[i + 1] = v;
+        img.data[i + 2] = v;
+        img.data[i + 3] = 185;
+      }
+    }
+    p.putImageData(img, 0, 0);
+  }
+
+  if (kind === "halftone") {
+    p.clearRect(0, 0, w, h);
+    const spacing = 10;
+    for (let y = spacing / 2; y < h; y += spacing) {
+      for (let x = spacing / 2; x < w; x += spacing) {
+        const r = 2 + Math.random() * 3;
+        p.beginPath();
+        p.arc(x, y, r, 0, Math.PI * 2);
+        p.fillStyle = "rgba(0,0,0,0.65)";
+        p.fill();
+      }
+    }
+  }
+
+  if (kind === "cmy") {
+    const pad = Math.floor(w * 0.05);
+    const bw = Math.floor((w - 3 * pad) / 3);
+    const bh = Math.floor(h - 2 * pad);
+    const off = () => Math.floor((Math.random() * 6) - 3); // -3..+3 px
+    p.globalAlpha = 0.7;
+    p.fillStyle = "rgb(0,255,255)";
+    p.fillRect(pad + off(), pad + off(), bw, bh);
+    p.fillStyle = "rgb(255,0,255)";
+    p.fillRect(pad + bw + pad + off(), pad + off(), bw, bh);
+    p.fillStyle = "rgb(255,255,0)";
+    p.fillRect(pad + 2 * (bw + pad) + off(), pad + off(), bw, bh);
+    p.globalAlpha = 1.0;
+  }
+
+  if (kind === "tapex") {
+    const tape = (x, y, len, th, rot, alpha = 0.75) => {
+      p.save();
+      p.translate(x, y); p.rotate(rot);
+      p.fillStyle = `rgba(245,230,180,${alpha})`;
+      p.fillRect(0, -th / 2, len, th);
+      // add little speckles to feel papery
+      for (let i = 0; i < Math.floor(len * th * 0.01); i++) {
+        p.fillStyle = "rgba(200,185,140,0.2)";
+        p.fillRect(Math.random() * len - 0.5, (Math.random() - 0.5) * th, 1, 1);
+      }
+      p.restore();
+    };
+    p.clearRect(0, 0, w, h);
+    const len = Math.max(w, h) * 0.9;
+    const th = Math.max(10, Math.min(w, h) * 0.12);
+    tape(w * 0.05, h * 0.5, len, th, 0.8);
+    tape(w * 0.95, h * 0.5, -len, th, -0.8);
+  }
+
+  if (kind === "photocopy") {
+    p.fillStyle = "#f8f8f8";
+    p.fillRect(0, 0, w, h);
+    for (let y = 0; y < h; y += 2) {
+      p.fillStyle = Math.random() < 0.5 ? "rgba(0,0,0,0.1)" : "rgba(0,0,0,0.03)";
+      p.fillRect(0, y, w, 1);
+    }
+    for (let i = 0; i < w * h * 0.006; i++) {
+      p.fillStyle = "rgba(0,0,0,0.5)";
+      p.fillRect(Math.random() * w, Math.random() * h, 1, 1);
+    }
+    p.strokeStyle = "rgba(0,0,0,0.8)";
+    p.lineWidth = 2;
+    p.strokeRect(1, 1, w - 2, h - 2);
+    p.globalAlpha = 0.85;
+  }
+
+  return patch;
+}
 
 function applySyntheticOverlay(){
   const region=lastAnalysis?.suggested_region||"center";

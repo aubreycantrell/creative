@@ -5,7 +5,8 @@
   <title>Collage Recommender (Serverless)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="assets/styles.css" />
+  <link rel="stylesheet" href="./assets/style.css" />
+  <script src="./assets/app.js" defer></script>
 </head>
 <body>
   <main class="container">
@@ -17,7 +18,11 @@
         <button id="analyzeBtn">Analyze</button>
         <button id="directBtn" title="Places a synthetic collage patch">Analyze + Direct Overlay</button>
         <button id="downloadPngBtn" disabled>Download Result PNG</button>
+        <!-- If you don't have a diffusion worker yet, hide this button in CSS or comment it out -->
+        <button id="diffuseBtn" class="btn btn-outline-primary">Analyze + Diffusion Overlay</button>
+        <button id="qwenBtn" class="btn btn-outline-secondary">Analyze + Qwen Edit</button>
       </div>
+
       <div class="preview">
         <canvas id="canvas" class="canvas"></canvas>
       </div>
@@ -43,7 +48,5 @@
       <div id="historyGrid" class="grid"></div>
     </section>
   </main>
-
-  <script src="assets/app.js"></script>
 </body>
 </html>

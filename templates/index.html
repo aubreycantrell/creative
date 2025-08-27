@@ -1,164 +1,73 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>AI Art Assistant — Collage (Serverless)</title>
+  <meta charset="utf-8" />
+  <title>Collage Analyzer (Client-only)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style>
-    /* Inlined so there are NO external file fetches */
-    #video { transform: scaleX(-1); }
-    .thumb { height: 80px; cursor: pointer; margin-right: 10px; }
-    .img-fluid { max-height: 70vh; object-fit: contain; }
-    .progress { height: 10px; }
-  </style>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="./assets/style.css?v=2">
 </head>
 <body class="bg-light">
-<div class="container-fluid py-4">
-  <div class="row">
-    <div class="col-md-6">
-      <div class="position-relative">
-        <video id="video" class="border w-100" autoplay playsinline></video>
-        <button class="btn btn-primary position-absolute bottom-0 start-0 m-3" onclick="captureAndSend()">Capture and Analyze</button>
-      </div>
+  <div class="container py-4">
+    <h1 class="h3 mb-4">Collage Analyzer</h1>
 
-      <div class="mt-3" id="loading" style="display: none;">
-        <div class="progress mb-2">
-          <div id="progress" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 0%"></div>
-        </div>
-        <p>Analyzing image…</p>
-      </div>
+    <!-- Upload -->
+    <div class="mb-3">
+      <label class="form-label">Choose an image</label>
+      <input id="fileInput" type="file" accept="image/*" class="form-control" />
+    </div>
 
-      <div id="instructions" class="bg-white p-3 border rounded mt-3">
-        <h5>Instructions</h5>
-        <p>Select one of the prompting modes:</p>
-        <div class="btn-group mb-3">
-          <button class="btn btn-outline-secondary" onclick="setMode('general')">Low Specify General</button>
-          <button class="btn btn-outline-secondary" onclick="setMode('artifact')">Low Specify Artifact</button>
-          <button class="btn btn-outline-secondary" onclick="setMode('direct')">High Specify Artifact</button>
+    <!-- Canvas / Preview -->
+    <div class="mb-3">
+      <canvas id="canvas" class="w-100 border rounded" style="max-height:70vh;"></canvas>
+    </div>
+
+    <!-- Actions -->
+    <div class="d-flex flex-wrap gap-2 mb-3">
+      <button id="analyzeBtn" class="btn btn-primary">Analyze</button>
+      <button id="directBtn" class="btn btn-outline-primary">Analyze + Direct Overlay</button>
+      <button id="downloadPngBtn" class="btn btn-outline-secondary" disabled>Download PNG</button>
+      <button id="downloadCsvBtn" class="btn btn-outline-secondary">Download CSV Log</button>
+    </div>
+
+    <!-- Output -->
+    <div class="row g-3">
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header">Features</div>
+          <div class="card-body">
+            <ul id="features" class="mb-0"></ul>
+          </div>
         </div>
-        <p><strong>Mode:</strong> <span id="modeLabel">GENERAL</span></p>
-        <p>Click the camera button to capture your work. You must submit your response before generating a new one.</p>
+      </div>
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header">Recommendations</div>
+          <div class="card-body">
+            <ul id="recs" class="mb-0"></ul>
+          </div>
+        </div>
       </div>
     </div>
 
-    <div class="col-md-6">
-      <img id="overlay" class="img-fluid mb-3 border" alt="analysis result"/>
-      <pre id="prompts" class="bg-white p-3 border rounded" style="min-height: 6rem;"></pre>
+    <!-- Accept / Skip -->
+    <div class="d-flex gap-2 mt-3">
+      <button id="acceptBtn" class="btn btn-success">Accept</button>
+      <button id="skipBtn" class="btn btn-warning">Skip</button>
+      <div id="status" class="ms-2 align-self-center small text-muted"></div>
+    </div>
 
-      <label for="decision" class="form-label">Do you accept the AI prompt?</label>
-      <select id="decision" class="form-select mb-3">
-        <option value="accept">Accept</option>
-        <option value="reject">Reject</option>
-        <option value="partially">Partially</option>
-      </select>
-
-      <input type="hidden" id="prompt_text">
-
-      <div class="d-flex gap-2">
-        <button id="submitBtn" class="btn btn-success" onclick="submitFeedback()">Submit Response</button>
-        <button class="btn btn-outline-secondary" onclick="downloadCsv()">Download CSV Log</button>
-      </div>
+    <!-- History -->
+    <div class="mt-4">
+      <h2 class="h5">History (this device)</h2>
+      <div id="historyGrid" class="d-flex flex-wrap gap-2"></div>
     </div>
   </div>
 
-  <div class="mt-5 border-top pt-3">
-    <h5>Previous Images</h5>
-    <div id="history" class="d-flex flex-wrap"></div>
-  </div>
-</div>
-
-<script>
-  // ---------- state ----------
-  let mode = "general";
-  let submissionMade = true;
-  let lastRecommendations = null;     // user-facing
-  let lastReasons = null;             // hidden rationale
-  let lastResultDataURL = "";         // image shown in #overlay
-  const HISTORY_KEY = "collage_history_dataurls";
-  const logRows = [["timestamp","user_decision","prompts","internal_explanations"]];
-
-  function setMode(selected) {
-    mode = selected;
-    document.getElementById("modeLabel").innerText = selected.replace("_"," ").toUpperCase();
-  }
-
-  // ---------- camera ----------
-  function initCamera() {
-    navigator.mediaDevices.getUserMedia({ video: true })
-      .then(stream => { document.querySelector("#video").srcObject = stream; })
-      .catch(() => alert("Camera permission is required."));
-  }
-  window.addEventListener("DOMContentLoaded", () => {
-    initCamera();
-    renderHistory(getHistory());
-  });
-
-  // ---------- capture → analyze (client-only) ----------
-  async function captureAndSend() {
-    if (!submissionMade) { alert("Please submit a response before generating a new prompt."); return; }
-    const video = document.querySelector("#video");
-    if (!video.videoWidth) { alert("Camera not ready yet."); return; }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0);
-    const dataURL = canvas.toDataURL("image/png");
-
-    // progress bar (kept from your original)
-    document.getElementById("loading").style.display = "block";
-    document.getElementById("progress").style.width = "0%";
-    let progress = 0;
-    const interval = setInterval(() => {
-      if (progress >= 100) { clearInterval(interval); return; }
-      progress += 2.86;
-      document.getElementById("progress").style.width = progress + "%";
-    }, 1000);
-
-    const result = analyzeDataURL(dataURL, mode);
-
-    clearInterval(interval);
-    document.getElementById("progress").style.width = "100%";
-
-    document.getElementById("prompt_text").value = result.prompts[0] || "";
-    document.getElementById("prompts").innerText = (result.prompts || []).join("\n");
-
-    lastResultDataURL = result.overlay_image || dataURL;
-    document.getElementById("overlay").src = lastResultDataURL;
-
-    renderHistory(addHistoryItem(lastResultDataURL));
-    document.getElementById("loading").style.display = "none";
-    submissionMade = false;
-
-    lastRecommendations = result.prompts || [];
-    lastReasons = result.internal_explanations || [];
-  }
-
-  // ---------- submit + CSV ----------
-  async function submitFeedback() {
-    const decision = document.querySelector("#decision").value;
-    const promptText = document.querySelector("#prompt_text").value;
-    if (!promptText) { alert("Please generate an image and prompt before submitting."); return; }
-
-    const ts = new Date().toISOString();
-    logRows.push([ts, decision,
-      (lastRecommendations || []).join(" | "),
-      (lastReasons || []).join(" ; ")
-    ]);
-    submissionMade = true;
-
-    const btn = document.querySelector("#submitBtn");
-    btn.disabled = true; setTimeout(()=>btn.disabled=false, 600);
-  }
-  function downloadCsv() {
-    const csv = logRows.map(r => r.map(v => `"${(v+"").replace(/"/g,'""')}"`).join(",")).join("\n");
-    const blob = new Blob([csv], {type:"text/csv"});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "interactions.csv"; a.click();
-    URL.revokeObjectURL(url);
-  }
-
+  <!-- Load your JS AFTER the DOM (defer) -->
+  <script src="./assets/app.js" defer></script>
+</body>
+</html>
   // ---------- history (local only) ----------
   function addHistoryItem(dataURL) {
     const list = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");

@@ -461,6 +461,8 @@ async function editWithQwen(imageDataURL, instruction) {
   return url;
 }
 
+sessionStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+
 
 function saveHistoryThumb(){const thumb=document.createElement("canvas"); const w=220,h=Math.round(canvas.height*(220/canvas.width)); thumb.width=w; thumb.height=h; const t=thumb.getContext("2d"); t.drawImage(canvas,0,0,w,h); const dataURL=thumb.toDataURL("image/png"); const list=JSON.parse(localStorage.getItem(HISTORY_KEY)||"[]"); list.push(dataURL); localStorage.setItem(HISTORY_KEY,JSON.stringify(list)); renderHistory();}
 function renderHistory(){const list=JSON.parse(localStorage.getItem(HISTORY_KEY)||"[]"); historyGrid.innerHTML=""; list.slice().reverse().forEach(u=>{const img=document.createElement("img"); img.src=u; img.alt="history item"; img.className="thumb"; historyGrid.appendChild(img);});}

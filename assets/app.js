@@ -28,6 +28,82 @@ let logRows = [["timestamp","user_decision","prompts","internal_explanations"]];
 const HISTORY_KEY = "collage_history_dataurls";
 
 /* ---------- helpers ---------- */
+
+function regionBoxFromCell(regionName, W, H) {
+  // box ~45% x 25% centered on anchor, matches your overlay sizing
+  const anchors = {
+    "top left":[0.05,0.08], "top center":[0.35,0.08], "top right":[0.65,0.08],
+    "middle left":[0.05,0.38], "center":[0.35,0.38], "middle right":[0.65,0.38],
+    "bottom left":[0.05,0.68], "bottom center":[0.35,0.68], "bottom right":[0.65,0.68]
+  };
+  const [ax, ay] = anchors[regionName] || [0.35, 0.38];
+  const w = Math.floor(W * 0.45);
+  const h = Math.floor(H * 0.25);
+  let x = Math.floor(W * ax - w/2);
+  let y = Math.floor(H * ay - h/2);
+  x = Math.max(0, Math.min(W - w, x));
+  y = Math.max(0, Math.min(H - h, y));
+  return { x, y, w, h };
+}
+
+function createRegionMask(canvas, box) {
+  // White (edit) inside box, black (protect) elsewhere — common convention.
+  const m = document.createElement("canvas");
+  m.width = canvas.width; m.height = canvas.height;
+  const g = m.getContext("2d");
+  g.fillStyle = "#000"; g.fillRect(0,0,m.width,m.height);
+  g.fillStyle = "#fff"; g.fillRect(box.x, box.y, box.w, box.h);
+  return m.toDataURL("image/png");
+}
+
+function colorAccentFromAnalysis(features) {
+  // keep it simple & tangible for paper media
+  return (features?.temperature === "cool")
+    ? "use a warm accent (red/orange/yellow paper)"
+    : "use a cool accent (cyan/teal/blue paper)";
+}
+
+function themeCuePrompt() {
+  // lightweight generic guidance—lets the model infer relevance from the photo
+  return "choose motifs that are thematically relevant to the main subject (e.g., flowers → seed packet stamp; travel/city → ticket stub or map sliver; beach → torn postcard; portrait → name label or barcode)";
+}
+
+function buildQwenInstruction(features, recs, regionName) {
+  const accent = colorAccentFromAnalysis(features);
+  const where = regionName || "center";
+  const materialWhitelist = "paper collage elements only: torn paper edges, masking tape X, thin checkerboard strip, newsprint halftone dots, barcode/receipt sliver, CMY registration blocks";
+  const donts = "do not alter global colors, do not blur, do not add frames/borders, do not cover faces or key subjects outside the target box, no text over existing text";
+
+  // Pull a short “what” from your recommendation list
+  const what = (recs && recs[0]) ? recs[0].replace(/\*\*/g,"") : "add a small collage element";
+
+  return [
+    // WHAT
+    `${what}.`,
+    // WHERE & SIZE
+    `Place it strictly inside the suggested region (“${where}”), fitting within the provided mask box; keep scale modest (approx. 30–50% of the box).`,
+    // MATERIALS
+    `Use ${materialWhitelist}. Prefer hard cut-out edges and matte look.`,
+    // COLOR
+    `Color constraint: ${accent}.`,
+    // THEME
+    `Relevance: ${themeCuePrompt()}.`,
+    // PROTECTION / NEGATIVE RULES
+    `Keep all other areas unchanged; ${donts}.`
+  ].join(" ");
+}
+
+function buildHumanJustification(features, reasons, regionName) {
+  const lines = [];
+  lines.push(`Placement: ${regionName} (emptiest grid cell).`);
+  if (features) {
+    lines.push(`Palette: ${features.temperature} image → add ${colorAccentFromAnalysis(features).replace('use ', '')}.`);
+  }
+  (reasons || []).forEach(r => lines.push(`Why: ${r}`));
+  lines.push("Theme: element should reference the photo’s subject (e.g., map/ticket/seed packet/etc.), so it feels intentionally scrapbooked.");
+  return lines.join(" ");
+}
+
 async function createBitmapFromBlob(blob) {
   if ('createImageBitmap' in window) {
     try { return await createImageBitmap(blob); } catch (_) {}
@@ -445,13 +521,14 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
   }
 });
 
-async function editWithQwen(imageDataURL, instruction) {
+async function editWithQwen(imageDataURL, instruction, maskDataURL) {
   const res = await fetch(`${API_BASE}/qwen-edit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       imageDataURL,
       prompt: instruction,
+      maskDataURL,          // NEW (Worker may pass through as `mask`)
       steps: 28,
       guidance: 4
     })
@@ -460,6 +537,48 @@ async function editWithQwen(imageDataURL, instruction) {
   if (error) throw new Error(error);
   return url;
 }
+
+
+document.getElementById("qwenBtn").addEventListener("click", async () => {
+  if (!srcImage) { alert("Choose an image first."); return; }
+
+  await analyze("general"); // gets features/recs/region
+  const region = lastAnalysis?.suggested_region || "center";
+  const box = regionBoxFromCell(region, canvas.width, canvas.height);
+  const maskDataURL = createRegionMask(canvas, box);
+
+  const instruction = buildQwenInstruction(lastAnalysis, lastRecommendations, region);
+  const justification = buildHumanJustification(lastAnalysis, lastReasons, region);
+
+  statusEl.textContent = "Editing via Qwen…";
+  try {
+    const url = await editWithQwen(
+      canvas.toDataURL("image/png"),
+      instruction,
+      maskDataURL // NEW
+    );
+
+    const edited = new Image();
+    edited.crossOrigin = "anonymous";
+    edited.onload = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
+      statusEl.textContent = "Done.";
+      // show the justification nicely in your UI
+      const li = document.createElement("li");
+      li.textContent = justification;
+      li.style.opacity = 0.8;
+      recsEl.appendChild(li);
+      saveHistoryThumb();
+    };
+    edited.src = url;
+  } catch (e) {
+    console.warn(e);
+    statusEl.textContent = "Qwen edit failed—using local overlay.";
+    applySyntheticOverlay();
+  }
+});
+
 
 
 

@@ -29,6 +29,45 @@ const HISTORY_KEY = "collage_history_v2"; // new structure
 
 /* ---------- helpers ---------- */
 
+// Add near your helpers
+function drawJustificationOnCanvas(text, region = "center") {
+  if (!text) return;
+  const W = canvas.width, H = canvas.height;
+
+  const anchors = {
+    "top left":[0.06,0.10], "top center":[0.50,0.10], "top right":[0.94,0.10],
+    "middle left":[0.06,0.50], "center":[0.50,0.50], "middle right":[0.94,0.50],
+    "bottom left":[0.06,0.90], "bottom center":[0.50,0.90], "bottom right":[0.94,0.90]
+  };
+  const [ax, ay] = anchors[region] || anchors["center"];
+  const x = Math.floor(W*ax), y = Math.floor(H*ay);
+
+  ctx.save();
+  ctx.font = `${Math.max(10, Math.floor(Math.min(W,H) * 0.018))}px sans-serif`;
+  ctx.textAlign = ax < 0.5 ? "left" : (ax > 0.5 ? "right" : "center");
+  ctx.textBaseline = "middle";
+
+  // subtle label: white box with faint border
+  const pad = 6;
+  const metrics = ctx.measureText(text);
+  const tw = Math.ceil(metrics.width) + pad*2;
+  const th = Math.ceil(parseInt(ctx.font,10)) + pad*1.2;
+
+  let bx = x - (ctx.textAlign === "center" ? tw/2 : (ctx.textAlign === "right" ? tw : 0));
+  let by = y - th/2;
+  bx = Math.max(4, Math.min(W - tw - 4, bx));
+  by = Math.max(4, Math.min(H - th - 4, by));
+
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.fillRect(bx, by, tw, th);
+  ctx.strokeStyle = "rgba(0,0,0,0.25)";
+  ctx.strokeRect(bx + 0.5, by + 0.5, tw - 1, th - 1);
+  ctx.fillStyle = "#222";
+  ctx.fillText(text, bx + pad, by + th/2);
+  ctx.restore();
+}
+
+
 function getCurrentMode() {
   return (document.getElementById("modeSelect")?.value || "collage");
 }
@@ -81,26 +120,6 @@ function paletteDirective(analysis) {
 
 function regionToMaskNote(region = "center") {
   return `Only modify the ${region} region; keep all other regions pixel-identical (no color or edge changes outside that area).`;
-}
-
-function buildQwenInstruction(recs, analysis, themeHint = "") {
-  const region = analysis?.suggested_region || "center";
-  const recText = (recs && recs.length ? recs[0] : "Add a small element").replace(/\*\*/g, "");
-  const mode = getCurrentMode();
-
-  const themeLine = themeHint
-    ? `Make the new element thematically related to "${themeHint}" but introduce a contrasting idea for creative diversity.`
-    : `Infer the main subject/theme from the image; make the new element thematically related but introduce a contrasting idea for creative diversity.`;
-
-  return [
-    `${recText} in the ${region}.`,
-    regionToMaskNote(region),
-    profileDirective(mode),
-    themeLine,
-    paletteDirective(analysis),
-    "Maintain believable physicality for the chosen medium; keep scale appropriate; no UI icons or digital artifacts.",
-    "Include a very small, subtle one-sentence justification printed/handwritten on or near the new element (stamp/marginalia) explaining how it increases tension/variety; keep it legible but understated."
-  ].join(" ");
 }
 
 
@@ -172,12 +191,15 @@ function readHistory() {
   catch { return []; }
 }
 function writeHistory(list) {
-  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(list)); }
-  catch (e) {
-    console.warn("localStorage full; falling back to sessionStorage", e);
-    sessionStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+  } catch (e) {
+    console.warn("localStorage failed, falling back to sessionStorage", e);
+    try { sessionStorage.setItem(HISTORY_KEY, JSON.stringify(list)); }
+    catch (ee) { console.error("sessionStorage failed too", ee); }
   }
 }
+
 
 
 // --- Collage generation guidance ---
@@ -265,32 +287,6 @@ function colorAccentFromAnalysis(features) {
 function themeCuePrompt() {
   // lightweight generic guidance—lets the model infer relevance from the photo
   return "choose motifs that are thematically relevant to the main subject (e.g., flowers → seed packet stamp; travel/city → ticket stub or map sliver; beach → torn postcard; portrait → name label or barcode)";
-}
-
-function buildQwenInstruction(features, recs, regionName) {
-  const accent = colorAccentFromAnalysis(features);
-  const where = regionName || "center";
-
-  const materialWhitelist =
-    "only paper- and collage-based materials such as torn or cut paper scraps, patterned textures, fabric swatches, stickers, stamps, magazine or book clippings, photographic fragments, painted marks, abstract cutouts, newsprint textures, tape or adhesive marks, and other handmade or printed ephemera. All elements should appear physical and analog, suitable for scrapbooking or collage layering.";
-
-  const donts =
-    "do not alter global colors, do not blur, do not add frames/borders, do not cover faces or key subjects outside the target box, no text over existing text";
-
-  const what =
-    (recs && recs[0])
-      ? recs[0].replace(/\*\*/g,"")
-      : "add a small collage element";
-
-  return [
-    `${what}.`,
-    `Place it strictly inside the suggested region (“${where}”), fitting within the provided mask box; keep scale modest (approx. 30–50% of the box).`,
-    `Use ${materialWhitelist}. Prefer crisp cut-out edges and matte look.`,
-    `Color constraint: ${accent}.`,
-    `Creativity cue: insert something that **diversifies the imagery** — introduce a visual or symbolic element *not already present* in the photo, yet thematically related (e.g., if the scene shows flowers, insert a torn seed packet; if it shows a city street, add a map sliver or barcode; if it shows a beach, add a vintage postcard fragment).`,
-    `Relevance: ${themeCuePrompt()}.`,
-    `Keep all other areas unchanged; ${donts}.`
-  ].join(" ");
 }
 
 
@@ -692,33 +688,8 @@ acceptBtn.addEventListener("click",()=>submitDecision("accept"));
 skipBtn.addEventListener("click",()=>submitDecision("skip"));
 downloadCsvBtn.addEventListener("click",()=>{const csv=logRows.map(r=>r.map(v=>`"${(v+"").replace(/"/g,'""')}"`).join(",")).join("\n"); const blob=new Blob([csv],{type:"text/csv"}); const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download="interactions.csv"; a.click(); URL.revokeObjectURL(url);});
 
-analyzeBtn.addEventListener("click",()=>analyze("general"));
-directBtn.addEventListener("click",()=>analyze("direct"));
-document.getElementById("diffuseBtn").addEventListener("click",async()=>{ if(!srcImage){alert("Choose an image first."); return;} await analyze("general"); await applyDiffusionOverlay(); });
 
-/* Qwen edit */
-document.getElementById("qwenBtn").addEventListener("click", async () => {
-  if (!srcImage) { alert("Choose an image first."); return; }
-  await analyze("general");
-  const instruction = (lastRecommendations?.[0] || "Add a small collage element in the suggested region.")
-    .replace(/\*\*/g, "") + ` Only modify the ${lastAnalysis?.suggested_region || "center"} area; keep all other areas unchanged.`;
-  statusEl.textContent = "Editing via Qwen…";
-  try {
-    const url = await editWithQwen(canvas.toDataURL("image/png"), instruction);
-    const edited = new Image();
-    edited.crossOrigin = "anonymous";
-    edited.onload = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
-      statusEl.textContent = "Done.";
-    };
-    edited.src = url;
-  } catch (e) {
-    console.warn(e);
-    statusEl.textContent = "Qwen edit failed—using local overlay.";
-    applySyntheticOverlay();
-  }
-});
+
 
 // After analyze finished drawing (no overlay yet):
 analyzeBtn.addEventListener("click", async () => {
@@ -730,7 +701,11 @@ directBtn.addEventListener("click", async () => {
   await analyze("general");
   await captureOriginal();
   applySyntheticOverlay();
-  await captureEdited();   // <-- edited state snapshot
+  drawJustificationOnCanvas(
+    "Local overlay adds structure/contrast in a low-activity region.",
+    lastAnalysis?.suggested_region
+  );
+  await captureEdited();
 });
 
 // Diffusion:
@@ -739,6 +714,10 @@ document.getElementById("diffuseBtn").addEventListener("click", async () => {
   await analyze("general");
   await captureOriginal();
   await applyDiffusionOverlay();
+  drawJustificationOnCanvas(
+    "Warm/cool accent increases tension and variety per analysis.",
+    lastAnalysis?.suggested_region
+  );
   await captureEdited();
 });
 
@@ -747,22 +726,42 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
   if (!srcImage) { alert("Choose an image first."); return; }
   await analyze("general");
   await captureOriginal();
-  // ... Qwen call ...
+
+  const region = lastAnalysis?.suggested_region || "center";
+  const box = regionBoxFromCell(region, canvas.width, canvas.height);
+  const maskDataURL = createRegionMask(canvas, box);
+
+  statusEl.textContent = "Editing via Qwen…";
   try {
-    const url = await editWithQwen(canvas.toDataURL("image/png"), buildQwenInstruction(lastRecommendations, lastAnalysis, getThemeHint()));
+    const url = await editWithQwen(
+      canvas.toDataURL("image/png"),
+      buildQwenInstruction(lastRecommendations, lastAnalysis, getThemeHint()),
+      maskDataURL // <- pass mask
+    );
+
     const edited = new Image();
+    edited.crossOrigin = "anonymous";
     edited.onload = async () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
+
+      drawJustificationOnCanvas(
+        "Context-linked insert diversifies imagery while staying on theme.",
+        region
+      );
+
       statusEl.textContent = "Done.";
       await captureEdited();
     };
-    edited.crossOrigin = "anonymous";
     edited.src = url;
   } catch (e) {
     console.warn(e);
     statusEl.textContent = "Qwen edit failed—using local overlay.";
     applySyntheticOverlay();
+    drawJustificationOnCanvas(
+      "Fallback overlay adds periodic contrast in the suggested region.",
+      region
+    );
     await captureEdited();
   }
 });
@@ -786,31 +785,6 @@ async function editWithQwen(imageDataURL, instruction, maskDataURL) {
 }
 
 
-document.getElementById("qwenBtn").addEventListener("click", async () => {
-  if (!srcImage) { alert("Choose an image first."); return; }
-  await analyze("general");
-
-  // NEW: build richer instruction
-  const instruction = buildQwenInstruction(lastRecommendations, lastAnalysis /*, optionalThemeHint */);
-
-  statusEl.textContent = "Editing via Qwen…";
-  try {
-    const url = await editWithQwen(canvas.toDataURL("image/png"), instruction);
-    const edited = new Image();
-    edited.crossOrigin = "anonymous";
-    edited.onload = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
-      statusEl.textContent = "Done.";
-    };
-    edited.src = url;
-  } catch (e) {
-    console.warn(e);
-    statusEl.textContent = "Qwen edit failed—using local overlay.";
-    applySyntheticOverlay();
-  }
-});
-
 document.getElementById("clearHistoryBtn").addEventListener("click", () => {
   localStorage.removeItem(HISTORY_KEY);
   sessionStorage.removeItem(HISTORY_KEY);
@@ -828,14 +802,3 @@ document.getElementById("downloadSessionBtn").addEventListener("click", () => {
   a.click(); URL.revokeObjectURL(url);
 });
 
-function renderHistory() {
-  const list = JSON.parse(sessionStorage.getItem(HISTORY_KEY) || "[]");
-  historyGrid.innerHTML = "";
-  list.slice().reverse().forEach(u => {
-    const img = document.createElement("img");
-    img.src = u;
-    img.alt = "history item";
-    img.className = "thumb";
-    historyGrid.appendChild(img);
-  });
-}

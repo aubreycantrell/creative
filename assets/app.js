@@ -29,6 +29,54 @@ const HISTORY_KEY = "collage_history_dataurls";
 
 /* ---------- helpers ---------- */
 
+// --- Collage generation guidance ---
+const MATERIAL_WHITELIST =
+  "only scrapbook-ready, analog-feeling materials: torn or cut paper scraps, patterned paper, newsprint/halftone textures, stickers, rubber-stamp marks, magazine/book clippings, photographic fragments, fabric or washi-tape swatches, painted or inked marks, abstract paper cutouts, adhesive/tape artifacts, and other printed ephemera. No 3D objects, no CGI, no glossy renders.";
+
+function regionToMaskNote(region = "center") {
+  return `Only modify the ${region} region. Keep all other regions pixel-identical (do not alter composition, color, or edges outside that region).`;
+}
+
+function paletteDirective(analysis) {
+  const { temperature = "neutral", colorfulness = 0, contrast = 0, entropy = 0 } = analysis || {};
+  const oppose = temperature === "cool"
+    ? "inject a subtle warm accent (yellows/reds/orange) to oppose coolness"
+    : "inject a desaturated/photocopy-like accent to oppose warmth";
+  const complexity = (contrast < 0.12 || entropy < 6.0)
+    ? "add crisp, high-contrast micro-structure"
+    : "prefer typographic/graphic variety over more texture";
+  return `Palette/texture intent: ${oppose}; ${complexity}. Match paper-like reflectance (matte), avoid glow/lighting effects.`;
+}
+
+/**
+ * Build a Qwen edit instruction that:
+ * - uses recommended region
+ * - encourages thematic-but-diverse scrap elements
+ * - constrains materials to scrapbook-friendly analog media
+ * - asks for a one-sentence justification to be embedded subtly on the element (tiny pencil note or stamp)
+ */
+function buildQwenInstruction(recs, analysis, themeHint = "") {
+  const region = analysis?.suggested_region || "center";
+  const recText = (recs && recs.length ? recs[0] : "Add a small collage element")  // take top rec
+    .replace(/\*\*/g, ""); // strip markdown bold if present
+
+  const themeLine = themeHint
+    ? `The new element should be thematically related to: "${themeHint}", but introduce a contrasting visual idea for creative diversity.`
+    : `Make the new element thematically related to the main subject of the photo (infer from visible content), but introduce a contrasting visual idea for creative diversity.`;
+
+  return [
+    `${recText} in the ${region}.`,
+    regionToMaskNote(region),
+    `Materials: ${MATERIAL_WHITELIST}`,
+    themeLine,
+    paletteDirective(analysis),
+    "Physical believability: hard cut-paper edges, slight deckle or fiber, matte surface; photographed/flat-scanned look; no drop shadows that imply 3D lighting.",
+    "Typography/images must look sourced from print (magazine, book, ticket, label) or handmade stamps/marks—no digital UI or screens.",
+    "Include a tiny, subtle one-sentence justification printed/handwritten on the added piece (e.g., a marginalia note or stamp) that explains why this insertion increases tension/variety; keep it legible but understated.",
+  ].join(" ");
+}
+
+
 function regionBoxFromCell(regionName, W, H) {
   // box ~45% x 25% centered on anchor, matches your overlay sizing
   const anchors = {
@@ -73,7 +121,7 @@ function buildQwenInstruction(features, recs, regionName) {
   const where = regionName || "center";
 
   const materialWhitelist =
-  "only paper- and collage-based materials such as torn or cut paper scraps, patterned textures, fabric swatches, stickers, stamps, magazine or book clippings, photographic fragments, painted marks, abstract cutouts, newsprint textures, tape or adhesive marks, and other handmade or printed ephemera. All elements should appear physical and analog, suitable for scrapbooking or collage layering.";
+    "only paper- and collage-based materials such as torn or cut paper scraps, patterned textures, fabric swatches, stickers, stamps, magazine or book clippings, photographic fragments, painted marks, abstract cutouts, newsprint textures, tape or adhesive marks, and other handmade or printed ephemera. All elements should appear physical and analog, suitable for scrapbooking or collage layering.";
 
   const donts =
     "do not alter global colors, do not blur, do not add frames/borders, do not cover faces or key subjects outside the target box, no text over existing text";
@@ -543,34 +591,20 @@ async function editWithQwen(imageDataURL, instruction, maskDataURL) {
 
 document.getElementById("qwenBtn").addEventListener("click", async () => {
   if (!srcImage) { alert("Choose an image first."); return; }
+  await analyze("general");
 
-  await analyze("general"); // gets features/recs/region
-  const region = lastAnalysis?.suggested_region || "center";
-  const box = regionBoxFromCell(region, canvas.width, canvas.height);
-  const maskDataURL = createRegionMask(canvas, box);
-
-  const instruction = buildQwenInstruction(lastAnalysis, lastRecommendations, region);
-  const justification = buildHumanJustification(lastAnalysis, lastReasons, region);
+  // NEW: build richer instruction
+  const instruction = buildQwenInstruction(lastRecommendations, lastAnalysis /*, optionalThemeHint */);
 
   statusEl.textContent = "Editing via Qwen…";
   try {
-    const url = await editWithQwen(
-      canvas.toDataURL("image/png"),
-      instruction,
-      maskDataURL // NEW
-    );
-
+    const url = await editWithQwen(canvas.toDataURL("image/png"), instruction);
     const edited = new Image();
     edited.crossOrigin = "anonymous";
     edited.onload = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
       statusEl.textContent = "Done.";
-      // show the justification nicely in your UI
-      const li = document.createElement("li");
-      li.textContent = justification;
-      li.style.opacity = 0.8;
-      recsEl.appendChild(li);
       saveHistoryThumb();
     };
     edited.src = url;
@@ -580,6 +614,7 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
     applySyntheticOverlay();
   }
 });
+
 
 
 

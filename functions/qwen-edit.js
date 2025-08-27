@@ -89,7 +89,9 @@ export async function onRequestOptions({ request }) {
         return cors(500, { error: "FAL returned no images and no request_id." });
       }
   
-      const deadline = Date.now() + 30000; // 30s poll
+      const waitMs = Number(env.FAL_WAIT_MS || 90000);
+      const deadline = Date.now() + waitMs;
+
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 1000));
         const res = await fetch(

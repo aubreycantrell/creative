@@ -19,6 +19,8 @@ const statusEl = document.getElementById("status");
 const historyGrid = document.getElementById("historyGrid");
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
+const MAX_HISTORY = 20; // prune oldest beyond this
+
 
 let srcImage = null;
 let lastAnalysis = null;
@@ -29,7 +31,46 @@ const HISTORY_KEY = "collage_history_v2"; // new structure
 
 /* ---------- helpers ---------- */
 
-// Add near your helpers
+// ---- IndexedDB tiny wrapper for image blobs ----
+const DB_NAME = "collageDB";
+const STORE = "images";
+
+function idbOpen () {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbPut(key, blob) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(blob, key);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function idbGet(key) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).get(key);
+    req.onsuccess = () => res(req.result || null);
+    req.onerror = () => rej(req.error);
+  });
+}
+async function idbDelete(key) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).delete(key);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+
 function drawJustificationOnCanvas(text, region = "center") {
   if (!text) return;
   const W = canvas.width, H = canvas.height;
@@ -150,38 +191,25 @@ function renderHistory() {
   historyGrid.innerHTML = "";
   list.slice().reverse().forEach(item => {
     const img = document.createElement("img");
-    img.src = (item.edited?.thumb || item.original?.thumb); // show edited if exists
+    img.src = (item.edited?.thumb || item.original?.thumb);
     img.alt = "history";
     img.className = "thumb";
     historyGrid.appendChild(img);
   });
 }
-let currentEntry = null; // temp holder for the in-progress run
-
-async function captureOriginal() {
-  const pair = await makeImagePairFromCanvas(canvas);
-  currentEntry = {
-    ts: new Date().toISOString(),
-    mode: getCurrentMode(),
-    features: lastAnalysis,
-    recs: lastRecommendations,
-    original: pair,
-    edited: null
-  };
-  const list = readHistory();
-  list.push(currentEntry);
-  writeHistory(list);
-  renderHistory();
-}
 
 async function captureEdited() {
-  if (!currentEntry) return; // safety
+  if (!currentEntry) return;
   const pair = await makeImagePairFromCanvas(canvas);
-  currentEntry.edited = pair;
-  // persist update
+  const fullBlob = await (await fetch(pair.full)).blob();
+  const ref = crypto.randomUUID();
+
+  await idbPut(ref, fullBlob);
+
+  currentEntry.edited = { ref, thumb: pair.thumb };
   const list = readHistory();
   list[list.length - 1] = currentEntry;
-  writeHistory(list);
+  await writeHistory(list);
   renderHistory();
 }
 
@@ -190,13 +218,23 @@ function readHistory() {
   try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); }
   catch { return []; }
 }
-function writeHistory(list) {
+
+async function writeHistory(list) {
+  // prune if too long (also delete associated blobs)
+  while (list.length > MAX_HISTORY) {
+    const removed = list.shift();
+    try {
+      if (removed?.original?.ref) await idbDelete(removed.original.ref);
+      if (removed?.edited?.ref) await idbDelete(removed.edited.ref);
+    } catch(_) {}
+  }
+  const json = JSON.stringify(list);
   try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+    localStorage.setItem(HISTORY_KEY, json);
   } catch (e) {
-    console.warn("localStorage failed, falling back to sessionStorage", e);
-    try { sessionStorage.setItem(HISTORY_KEY, JSON.stringify(list)); }
-    catch (ee) { console.error("sessionStorage failed too", ee); }
+    // fallback to sessionStorage if localStorage full
+    try { sessionStorage.setItem(HISTORY_KEY, json); }
+    catch (ee) { console.error("Both localStorage and sessionStorage are full", ee); }
   }
 }
 
@@ -300,6 +338,12 @@ function buildHumanJustification(features, reasons, regionName) {
   lines.push("Theme: element should reference the photo’s subject (e.g., map/ticket/seed packet/etc.), so it feels intentionally scrapbooked.");
   return lines.join(" ");
 }
+
+function shortJust() {
+  const region = lastAnalysis?.suggested_region || "center";
+  return (buildHumanJustification(lastAnalysis, lastReasons, region) || "").slice(0, 140);
+}
+
 
 async function createBitmapFromBlob(blob) {
   if ('createImageBitmap' in window) {
@@ -640,6 +684,8 @@ function applySyntheticOverlay(){
   x=Math.max(0,Math.min(W-w,x)); y=Math.max(0,Math.min(H-h,y));
   const rot=(Math.random()*12-6)*Math.PI/180;
   ctx.save(); ctx.translate(x+w/2,y+h/2); ctx.rotate(rot); ctx.drawImage(patch,-w/2,-h/2); ctx.restore();
+  drawJustificationOnCanvas(shortJust(), region);
+
 }
 
 /* ---------- analyze + buttons ---------- */
@@ -692,6 +738,26 @@ downloadCsvBtn.addEventListener("click",()=>{const csv=logRows.map(r=>r.map(v=>`
 
 
 // After analyze finished drawing (no overlay yet):
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById("saveCurrentBtn").addEventListener("click", async () => {
+  if (!currentEntry) { statusEl.textContent = "Nothing to save yet."; return; }
+  if (currentEntry.original?.ref) {
+    const b = await idbGet(currentEntry.original.ref);
+    if (b) downloadBlob(b, `original-${currentEntry.ts}.jpg`);
+  }
+  if (currentEntry.edited?.ref) {
+    const b = await idbGet(currentEntry.edited.ref);
+    if (b) downloadBlob(b, `edited-${currentEntry.ts}.jpg`);
+  }
+});
+
 analyzeBtn.addEventListener("click", async () => {
   await analyze("general");
   await captureOriginal(); // <-- add this; single original snapshot
@@ -745,11 +811,7 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
 
-      drawJustificationOnCanvas(
-        "Context-linked insert diversifies imagery while staying on theme.",
-        region
-      );
-
+      drawJustificationOnCanvas(shortJust(), lastAnalysis?.suggested_region);
       statusEl.textContent = "Done.";
       await captureEdited();
     };

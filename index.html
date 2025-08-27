@@ -22,6 +22,16 @@
         <button id="diffuseBtn" class="btn btn-outline-primary">Analyze + Diffusion Overlay</button>
         <button id="qwenBtn" class="btn btn-outline-secondary">Analyze + Qwen Edit</button>
       </div>
+      <label class="inline">
+        Mode:
+        <select id="modeSelect">
+          <option value="collage">Collage / Scrapbook</option>
+          <option value="drawing">Drawing / Illustration</option>
+          <option value="painting">Painting</option>
+          <option value="print">Photography / Print</option>
+          <option value="mixed">Mixed Media</option>
+        </select>
+      </label>
 
       <div class="preview">
         <canvas id="canvas" class="canvas"></canvas>
@@ -39,6 +49,8 @@
         <button id="acceptBtn">Accept</button>
         <button id="skipBtn">Skip</button>
         <button id="downloadCsvBtn">Download CSV Log</button>
+        <button id="downloadSessionBtn">Download Session (.json)</button>
+<button id="clearHistoryBtn">Clear History</button>
         <span id="status"></span>
       </div>
     </section>

@@ -25,9 +25,160 @@ let lastAnalysis = null;
 let lastRecommendations = null;
 let lastReasons = null;
 let logRows = [["timestamp","user_decision","prompts","internal_explanations"]];
-const HISTORY_KEY = "collage_history_dataurls";
+const HISTORY_KEY = "collage_history_v2"; // new structure
 
 /* ---------- helpers ---------- */
+
+function getCurrentMode() {
+  return (document.getElementById("modeSelect")?.value || "collage");
+}
+
+function getThemeHint() {
+  // optional: if you add a free-text <input id="themeHint">
+  const el = document.getElementById("themeHint");
+  return el && el.value ? el.value.trim() : "";
+}
+
+// Profiles: materials + rendering intent per mode
+const ART_PROFILES = {
+  collage: {
+    materials: "analog, scrapbook-ready materials: torn/cut paper, patterned paper, newsprint/halftone, stickers, rubber-stamp marks, magazine/book clippings, photographic fragments, fabric or washi-tape swatches, matte adhesive/tape artifacts, abstract paper cutouts, printed ephemera",
+    surface: "matte paper, flatbed scanned / photographed on neutral background, hard cut edges or slight deckle/fiber"
+  },
+  drawing: {
+    materials: "graphite, charcoal, ink, technical pen linework, brush pen, colored pencil, marker",
+    surface: "tooth of paper visible, cross-hatching or gesture lines, no digital glow, natural hand jitter"
+  },
+  painting: {
+    materials: "gouache, acrylic, watercolor, oil pastel, ink washes",
+    surface: "visible brushstrokes, paper/canvas texture, pigment granulation (for watercolor), no CGI lighting"
+  },
+  print: {
+    materials: "photographic print scraps, contact sheet frames, photocopy toner, risograph textures, screenprint dots",
+    surface: "grain/toner noise, slight misregistration, halftone dots, paper edge wear"
+  },
+  mixed: {
+    materials: "hybrid analog: paper scraps, ink marks, paint swatches, photocopy textures, stamped letters, stitched or taped seams",
+    surface: "layered, imperfect edges, matte reflectance; cohesive physical artifact"
+  }
+};
+
+function profileDirective(mode) {
+  const p = ART_PROFILES[mode] || ART_PROFILES.collage;
+  return `Materials: ${p.materials}. Physical surface: ${p.surface}.`;
+}
+
+function paletteDirective(analysis) {
+  const { temperature = "neutral", colorfulness = 0, contrast = 0, entropy = 0 } = analysis || {};
+  const oppose = temperature === "cool"
+    ? "add a warm accent (yellow/red/orange) to counter cool dominance"
+    : "add a desaturated/toner-like accent to counter warm dominance";
+  const complexity = (contrast < 0.12 || entropy < 6.0)
+    ? "increase micro-contrast with crisp structure or distinct marks"
+    : "prefer semantic/typographic variety over more texture";
+  return `Palette/structure intent: ${oppose}; ${complexity}. Avoid synthetic glow or CGI lighting.`;
+}
+
+function regionToMaskNote(region = "center") {
+  return `Only modify the ${region} region; keep all other regions pixel-identical (no color or edge changes outside that area).`;
+}
+
+function buildQwenInstruction(recs, analysis, themeHint = "") {
+  const region = analysis?.suggested_region || "center";
+  const recText = (recs && recs.length ? recs[0] : "Add a small element").replace(/\*\*/g, "");
+  const mode = getCurrentMode();
+
+  const themeLine = themeHint
+    ? `Make the new element thematically related to "${themeHint}" but introduce a contrasting idea for creative diversity.`
+    : `Infer the main subject/theme from the image; make the new element thematically related but introduce a contrasting idea for creative diversity.`;
+
+  return [
+    `${recText} in the ${region}.`,
+    regionToMaskNote(region),
+    profileDirective(mode),
+    themeLine,
+    paletteDirective(analysis),
+    "Maintain believable physicality for the chosen medium; keep scale appropriate; no UI icons or digital artifacts.",
+    "Include a very small, subtle one-sentence justification printed/handwritten on or near the new element (stamp/marginalia) explaining how it increases tension/variety; keep it legible but understated."
+  ].join(" ");
+}
+
+
+
+// Save a larger JPEG (to reduce quota) and a small thumbnail for the grid
+async function makeImagePairFromCanvas(cnv, maxW = 1600, thumbW = 260, quality = 0.92) {
+  // scale to maxW
+  const scale = Math.min(1, maxW / cnv.width);
+  const big = document.createElement("canvas");
+  big.width = Math.round(cnv.width * scale);
+  big.height = Math.round(cnv.height * scale);
+  big.getContext("2d").drawImage(cnv, 0, 0, big.width, big.height);
+
+  const full = big.toDataURL("image/jpeg", quality);
+
+  const thumbH = Math.round((cnv.height * thumbW) / cnv.width);
+  const thumb = document.createElement("canvas");
+  thumb.width = thumbW; thumb.height = thumbH;
+  thumb.getContext("2d").drawImage(cnv, 0, 0, thumbW, thumbH);
+  const thumbURL = thumb.toDataURL("image/jpeg", 0.8);
+
+  return { full, thumb: thumbURL };
+}
+
+// Render history grid (use thumbs only)
+function renderHistory() {
+  const list = readHistory();
+  historyGrid.innerHTML = "";
+  list.slice().reverse().forEach(item => {
+    const img = document.createElement("img");
+    img.src = (item.edited?.thumb || item.original?.thumb); // show edited if exists
+    img.alt = "history";
+    img.className = "thumb";
+    historyGrid.appendChild(img);
+  });
+}
+let currentEntry = null; // temp holder for the in-progress run
+
+async function captureOriginal() {
+  const pair = await makeImagePairFromCanvas(canvas);
+  currentEntry = {
+    ts: new Date().toISOString(),
+    mode: getCurrentMode(),
+    features: lastAnalysis,
+    recs: lastRecommendations,
+    original: pair,
+    edited: null
+  };
+  const list = readHistory();
+  list.push(currentEntry);
+  writeHistory(list);
+  renderHistory();
+}
+
+async function captureEdited() {
+  if (!currentEntry) return; // safety
+  const pair = await makeImagePairFromCanvas(canvas);
+  currentEntry.edited = pair;
+  // persist update
+  const list = readHistory();
+  list[list.length - 1] = currentEntry;
+  writeHistory(list);
+  renderHistory();
+}
+
+// Each entry: { ts, mode, features, recs, original: {full, thumb}, edited: {full, thumb} }
+function readHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); }
+  catch { return []; }
+}
+function writeHistory(list) {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(list)); }
+  catch (e) {
+    console.warn("localStorage full; falling back to sessionStorage", e);
+    sessionStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+  }
+}
+
 
 // --- Collage generation guidance ---
 const MATERIAL_WHITELIST =
@@ -509,7 +660,6 @@ async function analyze(mode){
 
   renderFeatures(lastAnalysis); renderRecs(recs);
   if(mode==="direct") applySyntheticOverlay();
-  saveHistoryThumb();
 }
 
 function renderFeatures(f){featuresEl.innerHTML=""; const entries={"temperature":f.temperature,"colorfulness":f.colorfulness.toFixed(3),"contrast":f.contrast.toFixed(3),"edge_density":f.edge_density.toFixed(3),"entropy":f.entropy.toFixed(3),"suggested_region":f.suggested_region}; Object.entries(entries).forEach(([k,v])=>{const li=document.createElement("li"); li.textContent=`${k}: ${v}`; featuresEl.appendChild(li);});}
@@ -561,7 +711,6 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
       statusEl.textContent = "Done.";
-      saveHistoryThumb();
     };
     edited.src = url;
   } catch (e) {
@@ -570,6 +719,54 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
     applySyntheticOverlay();
   }
 });
+
+// After analyze finished drawing (no overlay yet):
+analyzeBtn.addEventListener("click", async () => {
+  await analyze("general");
+  await captureOriginal(); // <-- add this; single original snapshot
+});
+
+directBtn.addEventListener("click", async () => {
+  await analyze("general");
+  await captureOriginal();
+  applySyntheticOverlay();
+  await captureEdited();   // <-- edited state snapshot
+});
+
+// Diffusion:
+document.getElementById("diffuseBtn").addEventListener("click", async () => {
+  if (!srcImage) { alert("Choose an image first."); return; }
+  await analyze("general");
+  await captureOriginal();
+  await applyDiffusionOverlay();
+  await captureEdited();
+});
+
+// Qwen:
+document.getElementById("qwenBtn").addEventListener("click", async () => {
+  if (!srcImage) { alert("Choose an image first."); return; }
+  await analyze("general");
+  await captureOriginal();
+  // ... Qwen call ...
+  try {
+    const url = await editWithQwen(canvas.toDataURL("image/png"), buildQwenInstruction(lastRecommendations, lastAnalysis, getThemeHint()));
+    const edited = new Image();
+    edited.onload = async () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
+      statusEl.textContent = "Done.";
+      await captureEdited();
+    };
+    edited.crossOrigin = "anonymous";
+    edited.src = url;
+  } catch (e) {
+    console.warn(e);
+    statusEl.textContent = "Qwen edit failed—using local overlay.";
+    applySyntheticOverlay();
+    await captureEdited();
+  }
+});
+
 
 async function editWithQwen(imageDataURL, instruction, maskDataURL) {
   const res = await fetch(`${API_BASE}/qwen-edit`, {
@@ -605,7 +802,6 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
       statusEl.textContent = "Done.";
-      saveHistoryThumb();
     };
     edited.src = url;
   } catch (e) {
@@ -615,33 +811,22 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
   }
 });
 
+document.getElementById("clearHistoryBtn").addEventListener("click", () => {
+  localStorage.removeItem(HISTORY_KEY);
+  sessionStorage.removeItem(HISTORY_KEY);
+  currentEntry = null;
+  renderHistory();
+  statusEl.textContent = "History cleared (this device only).";
+});
 
-
-
-
-function saveHistoryThumb() {
-  // make a small thumbnail from the current canvas
-  const thumb = document.createElement("canvas");
-  const w = 220, h = Math.max(1, Math.round(canvas.height * (220 / canvas.width)));
-  thumb.width = w; thumb.height = h;
-  const t = thumb.getContext("2d");
-  t.drawImage(canvas, 0, 0, w, h);
-
-  const dataURL = thumb.toDataURL("image/png");
-
-  try {
-    const list = JSON.parse(sessionStorage.getItem(HISTORY_KEY) || "[]");
-    list.push(dataURL);
-
-    // keep only the last 20 to stay safe on quota
-    if (list.length > 20) list.splice(0, list.length - 20);
-
-    sessionStorage.setItem(HISTORY_KEY, JSON.stringify(list));
-    renderHistory();
-  } catch (e) {
-    console.warn("Could not save history thumbnail:", e);
-  }
-}
+document.getElementById("downloadSessionBtn").addEventListener("click", () => {
+  const data = JSON.stringify(readHistory(), null, 2);
+  const blob = new Blob([data], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "collage_session.json";
+  a.click(); URL.revokeObjectURL(url);
+});
 
 function renderHistory() {
   const list = JSON.parse(sessionStorage.getItem(HISTORY_KEY) || "[]");

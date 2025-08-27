@@ -71,27 +71,29 @@ function themeCuePrompt() {
 function buildQwenInstruction(features, recs, regionName) {
   const accent = colorAccentFromAnalysis(features);
   const where = regionName || "center";
-  const materialWhitelist = "paper collage elements only: torn paper edges, masking tape X, thin checkerboard strip, newsprint halftone dots, barcode/receipt sliver, CMY registration blocks";
-  const donts = "do not alter global colors, do not blur, do not add frames/borders, do not cover faces or key subjects outside the target box, no text over existing text";
 
-  // Pull a short “what” from your recommendation list
-  const what = (recs && recs[0]) ? recs[0].replace(/\*\*/g,"") : "add a small collage element";
+  const materialWhitelist =
+  "only paper- and collage-based materials such as torn or cut paper scraps, patterned textures, fabric swatches, stickers, stamps, magazine or book clippings, photographic fragments, painted marks, abstract cutouts, newsprint textures, tape or adhesive marks, and other handmade or printed ephemera. All elements should appear physical and analog, suitable for scrapbooking or collage layering.";
+
+  const donts =
+    "do not alter global colors, do not blur, do not add frames/borders, do not cover faces or key subjects outside the target box, no text over existing text";
+
+  const what =
+    (recs && recs[0])
+      ? recs[0].replace(/\*\*/g,"")
+      : "add a small collage element";
 
   return [
-    // WHAT
     `${what}.`,
-    // WHERE & SIZE
     `Place it strictly inside the suggested region (“${where}”), fitting within the provided mask box; keep scale modest (approx. 30–50% of the box).`,
-    // MATERIALS
-    `Use ${materialWhitelist}. Prefer hard cut-out edges and matte look.`,
-    // COLOR
+    `Use ${materialWhitelist}. Prefer crisp cut-out edges and matte look.`,
     `Color constraint: ${accent}.`,
-    // THEME
+    `Creativity cue: insert something that **diversifies the imagery** — introduce a visual or symbolic element *not already present* in the photo, yet thematically related (e.g., if the scene shows flowers, insert a torn seed packet; if it shows a city street, add a map sliver or barcode; if it shows a beach, add a vintage postcard fragment).`,
     `Relevance: ${themeCuePrompt()}.`,
-    // PROTECTION / NEGATIVE RULES
     `Keep all other areas unchanged; ${donts}.`
   ].join(" ");
 }
+
 
 function buildHumanJustification(features, reasons, regionName) {
   const lines = [];

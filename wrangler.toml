@@ -1,0 +1,9 @@
+name = "collage-proxy"
+main = "worker/worker.js"
+compatibility_date = "2024-11-12"
+
+# CORS — set your actual page URLs:
+[vars]
+ALLOWED_ORIGINS = "http://localhost:8080,https://aubreycantrell.github.io,http://[::]:8080"
+
+# (Do NOT put your fal key here; add as a secret in step 3)

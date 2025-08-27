@@ -2,6 +2,9 @@
 
 // If you don't have a diffusion worker yet, keep this null.
 const DIFFUSION_URL = null; // 'https://<YOUR-WORKER>.workers.dev'
+// top of file
+const API_BASE = 'https://collage-proxy.ac138.workers.dev';
+
 
 const fileInput = document.getElementById("fileInput");
 const analyzeBtn = document.getElementById("analyzeBtn");
@@ -443,7 +446,7 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
 });
 
 async function editWithQwen(imageDataURL, instruction) {
-  const res = await fetch("/qwen-edit", {
+  const res = await fetch(`${API_BASE}/qwen-edit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -457,6 +460,7 @@ async function editWithQwen(imageDataURL, instruction) {
   if (error) throw new Error(error);
   return url;
 }
+
 
 function saveHistoryThumb(){const thumb=document.createElement("canvas"); const w=220,h=Math.round(canvas.height*(220/canvas.width)); thumb.width=w; thumb.height=h; const t=thumb.getContext("2d"); t.drawImage(canvas,0,0,w,h); const dataURL=thumb.toDataURL("image/png"); const list=JSON.parse(localStorage.getItem(HISTORY_KEY)||"[]"); list.push(dataURL); localStorage.setItem(HISTORY_KEY,JSON.stringify(list)); renderHistory();}
 function renderHistory(){const list=JSON.parse(localStorage.getItem(HISTORY_KEY)||"[]"); historyGrid.innerHTML=""; list.slice().reverse().forEach(u=>{const img=document.createElement("img"); img.src=u; img.alt="history item"; img.className="thumb"; historyGrid.appendChild(img);});}

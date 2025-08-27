@@ -1,102 +1,161 @@
-// Cloudflare Worker: proxy → Hugging Face Inference (sd-turbo)
-// Caches results by prompt+params, adds CORS for your Pages front-end.
-
 export default {
     async fetch(request, env, ctx) {
-      // CORS preflight
+      const url = new URL(request.url);
+  
+      // --- CORS preflight
       if (request.method === "OPTIONS") {
-        return new Response(null, {
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type"
-          }
-        });
-      }
-      if (request.method !== "POST") {
-        return new Response("Only POST supported", { status: 405 });
+        return new Response(null, { headers: corsHeaders(env, request) });
       }
   
-      let body;
-      try { body = await request.json(); } 
-      catch { return cors(new Response("Invalid JSON", { status: 400 })); }
-  
-      const {
-        prompt = "collage paper cut-out on white background",
-        width = 512,
-        height = 384,
-        steps = 6,
-        guidance = 1.0,
-        model = "stabilityai/sd-turbo"
-      } = body;
-  
-      // clamp for safety / iPad perf
-      const W = Math.min(Math.max(128, width), 768);
-      const H = Math.min(Math.max(128, height), 768);
-      const S = Math.min(Math.max(1, steps), 12);
-      const G = Math.min(Math.max(0, guidance), 7.5);
-  
-      // Build cache key (GET URL w/ hash so we can cache a POST)
-      const keyStr = JSON.stringify({ model, prompt, W, H, S, G });
-      const hash = await sha256(keyStr);
-      const cacheUrl = new URL(request.url);
-      cacheUrl.pathname = "/image";
-      cacheUrl.search = `?key=${hash}`;
-      const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
-  
-      // Edge cache
-      const cache = caches.default;
-      const cached = await cache.match(cacheKey);
-      if (cached) return cors(cached);
-  
-      // Call Hugging Face Inference API
-      const r = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${env.HF_TOKEN}`,
-          "Content-Type": "application/json",
-          "Accept": "image/png"
-        },
-        body: JSON.stringify({
-          inputs: prompt,
-          parameters: {
-            width: W, height: H,
-            num_inference_steps: S,
-            guidance_scale: G
-          }
-        })
-      });
-  
-      if (!r.ok) {
-        const text = await r.text();
-        return cors(new Response(text || "Upstream error", { status: r.status }));
-      }
-  
-      const buf = await r.arrayBuffer();
-      const resp = new Response(buf, {
-        headers: {
-          "Content-Type": "image/png",
-          "Cache-Control": "public, max-age=86400, s-maxage=86400"
+      try {
+        if (url.pathname === "/qwen-edit" && request.method === "POST") {
+          return await handleQwenEdit(request, env);
         }
-      });
   
-      // store in cache (async)
-      ctx.waitUntil(cache.put(cacheKey, resp.clone()));
-      return cors(resp);
+        if (url.pathname === "/diffuse" && request.method === "POST") {
+          // Optional text-to-image passthrough (keep for future)
+          return await handleDiffuse(request, env);
+        }
+  
+        return new Response("Not found", { status: 404, headers: corsHeaders(env, request) });
+      } catch (err) {
+        return json({ error: err.message }, 500, env, request);
+      }
     }
+  };
+  
+  /* ------------------------ Handlers ------------------------ */
+  
+  async function handleQwenEdit(request, env) {
+    const { imageDataURL, prompt, steps = 28, guidance = 4 } = await request.json();
+  
+    // Submit job to fal queue
+    const submit = await fetch("https://queue.fal.run/fal-ai/qwen-image-edit", {
+      method: "POST",
+      headers: {
+        "Authorization": `Key ${env.FAL_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        prompt,
+        image_url: imageDataURL,        // data: URL OK with fal
+        num_inference_steps: steps,
+        guidance_scale: guidance,
+        output_format: "png",
+        sync_mode: true                 // if unsupported, we'll poll below
+      })
+    });
+  
+    // If auth/model issues, surface body text for debugging
+    if (!submit.ok) {
+      const t = await submit.text();
+      throw new Error(`fal submit failed: ${submit.status} ${t}`);
+    }
+  
+    const submitJson = await submit.json();
+  
+    // If sync mode returned output, send it back now
+    if (submitJson?.images?.length) {
+      return json({ url: submitJson.images[0].url }, 200, env, request);
+    }
+  
+    const reqId = submitJson.request_id;
+    if (!reqId) throw new Error("No request_id from fal");
+  
+    // Poll queue for result (up to ~30s)
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      await sleep(1000);
+      const res = await fetch(`https://queue.fal.run/fal-ai/qwen-image-edit/requests/${reqId}`, {
+        headers: { "Authorization": `Key ${env.FAL_KEY}` }
+      });
+      if (!res.ok) continue;
+      const out = await res.json();
+      if (out?.images?.length) {
+        return json({ url: out.images[0].url }, 200, env, request);
+      }
+    }
+  
+    throw new Error("Timeout waiting for fal result");
   }
   
-  function cors(response) {
-    const headers = new Headers(response.headers);
-    headers.set("Access-Control-Allow-Origin", "*");
-    headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-    headers.set("Access-Control-Allow-Headers", "Content-Type");
-    return new Response(response.body, { status: response.status, headers });
+  // Stub text-to-image proxy (wire to your chosen fal model later)
+  async function handleDiffuse(request, env) {
+    const { prompt, width = 512, height = 384 } = await request.json();
+  
+    // Example queue call (replace with your preferred model id)
+    const submit = await fetch("https://queue.fal.run/fal-ai/flux/schnell", {
+      method: "POST",
+      headers: {
+        "Authorization": `Key ${env.FAL_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        prompt,
+        image_size: `${width}x${height}`,
+        output_format: "png",
+        sync_mode: true
+      })
+    });
+  
+    if (!submit.ok) {
+      const t = await submit.text();
+      throw new Error(`fal submit failed: ${submit.status} ${t}`);
+    }
+  
+    const submitJson = await submit.json();
+    if (submitJson?.images?.length) {
+      return json({ url: submitJson.images[0].url }, 200, env, request);
+    }
+  
+    const reqId = submitJson.request_id;
+    if (!reqId) throw new Error("No request_id from fal");
+  
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      await sleep(1000);
+      const res = await fetch(`https://queue.fal.run/fal-ai/flux/schnell/requests/${reqId}`, {
+        headers: { "Authorization": `Key ${env.FAL_KEY}` }
+      });
+      if (!res.ok) continue;
+      const out = await res.json();
+      if (out?.images?.length) {
+        return json({ url: out.images[0].url }, 200, env, request);
+      }
+    }
+  
+    throw new Error("Timeout waiting for fal result");
   }
   
-  async function sha256(s) {
-    const data = new TextEncoder().encode(s);
-    const digest = await crypto.subtle.digest("SHA-256", data);
-    return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+  /* ------------------------ Helpers ------------------------ */
+  
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  
+  function allowedOrigins(env) {
+    // Comma-separated in wrangler.toml vars
+    const raw = env.ALLOWED_ORIGINS || "";
+    return raw.split(",").map(s => s.trim()).filter(Boolean);
+  }
+  
+  function corsHeaders(env, request) {
+    const origin = request.headers.get("Origin") || "";
+    const list = allowedOrigins(env);
+    const allow = list.includes(origin) ? origin : list[0] || "*";
+    return {
+      "Access-Control-Allow-Origin": allow,
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Max-Age": "86400"
+    };
+  }
+  
+  function json(obj, status, env, request) {
+    return new Response(JSON.stringify(obj), {
+      status,
+      headers: {
+        "Content-Type": "application/json",
+        ...corsHeaders(env, request)
+      }
+    });
   }
   

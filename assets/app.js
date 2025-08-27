@@ -20,6 +20,8 @@ const historyGrid = document.getElementById("historyGrid");
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
 const MAX_HISTORY = 20; // prune oldest beyond this
+let currentEntry = null;
+
 
 
 let srcImage = null;
@@ -30,6 +32,12 @@ let logRows = [["timestamp","user_decision","prompts","internal_explanations"]];
 const HISTORY_KEY = "collage_history_v2"; // new structure
 
 /* ---------- helpers ---------- */
+function on(id, evt, handler) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener(evt, handler);
+  else console.warn(`Missing #${id} in DOM, skipped ${evt} binding`);
+}
+
 
 // ---- IndexedDB tiny wrapper for image blobs ----
 const DB_NAME = "collageDB";
@@ -197,6 +205,35 @@ function renderHistory() {
     historyGrid.appendChild(img);
   });
 }
+
+
+async function captureOriginal() {
+  if (!srcImage) return; // nothing loaded yet
+
+  // Make full + thumb from the canvas
+  const pair = await makeImagePairFromCanvas(canvas);
+  const fullBlob = await (await fetch(pair.full)).blob();
+
+  // Store the full image in IndexedDB, keep the thumb in local history
+  const ref = crypto.randomUUID();
+  await idbPut(ref, fullBlob);
+
+  // Build the history entry
+  currentEntry = {
+    ts: new Date().toISOString(),
+    mode: (typeof getCurrentMode === "function" ? getCurrentMode() : "collage"),
+    features: lastAnalysis || null,
+    recs: lastRecommendations || [],
+    original: { ref, thumb: pair.thumb },
+    edited: null
+  };
+
+  const list = readHistory();
+  list.push(currentEntry);
+  await writeHistory(list);
+  renderHistory();
+}
+
 
 async function captureEdited() {
   if (!currentEntry) return;

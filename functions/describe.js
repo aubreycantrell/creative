@@ -1,4 +1,5 @@
-// functions/describe.js  (Cloudflare Pages Function)
+// functions/describe.js  — Cloudflare Pages Function for image description
+// Returns JSON: { caption: string, keywords: string[] }
 
 export async function onRequestOptions({ request }) {
     return new Response(null, {
@@ -7,6 +8,7 @@ export async function onRequestOptions({ request }) {
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
         "Access-Control-Max-Age": "86400",
+        "Vary": "Origin",
       },
     });
   }
@@ -23,11 +25,13 @@ export async function onRequestOptions({ request }) {
       });
   
     try {
-      const { imageDataURL } = await request.json();
-      if (!env.FAL_KEY) return cors(500, { error: "Missing FAL_KEY in environment." });
-      if (!imageDataURL) return cors(400, { error: "imageDataURL required." });
+      const { imageDataURL, extraPrompt } = await request.json();
+      if (!imageDataURL) return cors(400, { error: "imageDataURL required" });
   
-      // Convert DataURL -> Blob (so we don’t need a public URL)
+      // If no API key, return a benign empty result so UI can fall back gracefully.
+      if (!env.FAL_KEY) return cors(200, { caption: "", keywords: [] });
+  
+      // ---- helpers ----
       const dataURLtoBlob = (dataURL) => {
         const m = /^data:(.*?);base64,(.*)$/.exec(dataURL);
         if (!m) throw new Error("Invalid data URL");
@@ -36,35 +40,97 @@ export async function onRequestOptions({ request }) {
         return new Blob([bin], { type: mime });
       };
   
+      // Build multipart body so we don't need a public URL
       const form = new FormData();
-      form.append("image", dataURLtoBlob(imageDataURL), "image.jpg");
       form.append(
         "prompt",
-        'Describe the main subject in one concise sentence, then list 8-12 single-word lowercase keywords (mostly concrete nouns). ' +
-        'Respond ONLY as minified JSON: {"caption": "...", "keywords": ["...","..."]}'
+        [
+          // keep it short + structured so we can parse reliably
+          "Describe the main subject in ONE short sentence.",
+          "Then on a new line write: Keywords: five lower-case nouns or activities, comma-separated.",
+          extraPrompt ? `Context: ${extraPrompt}` : "",
+        ]
+          .filter(Boolean)
+          .join(" ")
       );
+      form.append("image", dataURLtoBlob(imageDataURL), "image.jpg");
   
-      // Use a visual-language model you have access to on FAL.
-      // If "fal-ai/llava-next" isn't available for your account, swap to
-      // another captioning model you do have (e.g., a different llava variant).
+      // Use a general vision-captioning model on FAL; change path if you prefer another
       const submit = await fetch("https://queue.fal.run/fal-ai/llava-next", {
         method: "POST",
         headers: { Authorization: `Key ${env.FAL_KEY}` },
         body: form,
       });
   
-      const out = await submit.json();
-      // Many FAL VLMs return { output_text: "<json string>" }
-      let caption = "", keywords = [];
-      try {
-        const txt = out?.output_text || out?.text || "";
-        const parsed = JSON.parse(txt);
-        caption = parsed.caption || "";
-        keywords = Array.isArray(parsed.keywords) ? parsed.keywords : [];
-      } catch {
-        // conservative fallback
-        caption = out?.caption || "scene";
-        keywords = Array.isArray(out?.keywords) ? out.keywords : [];
+      const ct = submit.headers.get("content-type") || "";
+      if (!submit.ok) {
+        const errText = ct.includes("application/json")
+          ? JSON.stringify(await submit.json())
+          : await submit.text();
+        return cors(submit.status, { error: `FAL error: ${errText}` });
+      }
+  
+      const submitJson = ct.includes("application/json") ? await submit.json() : {};
+  
+      // Case A: some endpoints respond immediately with text
+      let text =
+        submitJson.output_text ||
+        submitJson.text ||
+        submitJson.result ||
+        (Array.isArray(submitJson.choices) && submitJson.choices[0]?.text) ||
+        "";
+  
+      // Case B: queued → poll with request_id
+      if (!text && submitJson.request_id) {
+        const waitMs = Number(env.FAL_WAIT_MS || 45000);
+        const deadline = Date.now() + waitMs;
+  
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const res = await fetch(
+            `https://queue.fal.run/fal-ai/llava-next/requests/${submitJson.request_id}`,
+            { headers: { Authorization: `Key ${env.FAL_KEY}` } }
+          );
+          const out = await res.json();
+          if (out?.error) return cors(500, { error: `FAL queued error: ${out.error}` });
+  
+          text =
+            out.output_text ||
+            out.text ||
+            out.result ||
+            (Array.isArray(out.choices) && out.choices[0]?.text) ||
+            "";
+  
+          if (text) break;
+        }
+  
+        if (!text) return cors(504, { error: "Timeout waiting for FAL result." });
+      }
+  
+      // Robust parsing: extract "Keywords: a, b, c" if present
+      const m = /keywords:\s*([^\n]+)/i.exec(text || "");
+      let keywords = (m ? m[1] : "")
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean)
+        .slice(0, 8);
+  
+      // Caption = first line before Keywords:
+      let caption = (text || "").split(/keywords:/i)[0]?.trim() || "";
+  
+      // Fallbacks if model didn't follow the format
+      if (!caption) {
+        caption = (text || "").split("\n")[0].trim();
+      }
+      if (keywords.length === 0) {
+        // naive fallback keyworder: pick distinct words >3 chars from caption
+        const seen = new Set();
+        for (const w of caption.toLowerCase().split(/[^a-z0-9]+/g)) {
+          if (w.length > 3 && !seen.has(w)) {
+            seen.add(w);
+          }
+        }
+        keywords = Array.from(seen).slice(0, 5);
       }
   
       return cors(200, { caption, keywords });

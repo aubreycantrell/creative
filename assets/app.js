@@ -38,6 +38,64 @@ function on(id, evt, handler) {
   else console.warn(`Missing #${id} in DOM, skipped ${evt} binding`);
 }
 
+// --- Describe → choose a concrete insert ---
+
+async function describeImageViaWorker(imageDataURL) {
+  const res = await fetch(`${API_BASE}/describe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ imageDataURL })
+  });
+  const j = await res.json();
+  if (j.error) throw new Error(j.error);
+  return { caption: j.caption || "", keywords: Array.isArray(j.keywords) ? j.keywords : [] };
+}
+
+// Keyword → specific artifact catalog
+const SPEC_INSERT_CATALOG = [
+  { key: ["flower","garden","plant","leaf","botanical"], insert: "a vintage seed packet label with a small botanical illustration and price mark" },
+  { key: ["beach","ocean","sea","surf","coast","sand"], insert: "a torn postcard corner with a postal cancellation stamp and a few handwritten words" },
+  { key: ["city","street","building","architecture","urban","bridge","car","traffic","train","subway","bus"], insert: "a small map fragment with a street grid and a circled intersection" },
+  { key: ["music","concert","piano","guitar","violin","band","orchestra","notes"], insert: "a narrow strip of aged sheet music with a tempo marking" },
+  { key: ["ticket","museum","event","theater","cinema","railway"], insert: "a perforated ticket stub with serial numbers" },
+  { key: ["bird","animal","wildlife","dog","cat","horse","fish","insect"], insert: "an encyclopedia clipping of a small animal engraving with its Latin name" },
+  { key: ["food","cafe","kitchen","fruit","bread","coffee","restaurant"], insert: "a grocery price tag or receipt sliver with an item name" },
+  { key: ["travel","airplane","airport","passport","luggage","road","map"], insert: "a vintage luggage label or baggage tag with a bold IATA code" },
+  { key: ["sports","soccer","football","basketball","baseball","tennis","stadium"], insert: "a ticket corner or scoreboard snippet with a date" },
+  { key: ["*"], insert: "a small diagram label or index tab that references the scene" }, // fallback
+];
+
+function chooseSpecificInsert(keywords = [], themeHint = "") {
+  const kw = new Set(keywords.map(k => (k || "").toLowerCase()));
+  let row = SPEC_INSERT_CATALOG.find(r => r.key.some(k => k !== "*" && kw.has(k)));
+  if (!row && themeHint) {
+    const th = themeHint.toLowerCase();
+    row = SPEC_INSERT_CATALOG.find(r => r.key.some(k => k !== "*" && th.includes(k)));
+  }
+  if (!row) row = SPEC_INSERT_CATALOG.find(r => r.key.includes("*"));
+  return row.insert;
+}
+
+// Build a specific Qwen instruction with the chosen insert
+function buildQwenInstructionSpecific(features, recs, theme, insertText) {
+  const region = features?.suggested_region || "center";
+  const mode = getCurrentMode();
+  const recText = (recs && recs[0] ? recs[0].replace(/\*\*/g, "") : "Add a small element");
+  const subject = getThemeHint() || theme?.caption || "the main subject";
+
+  return [
+    `${recText} in the ${region}.`,
+    regionToMaskNote(region),
+    profileDirective(mode),
+    `Insert specifically: ${insertText}. It must relate to "${subject}" yet introduce a contrasting visual idea to diversify the imagery.`,
+    paletteDirective(features),
+    "Materials must feel analog/scrapbook-ready (matte, cut edges, slight deckle/fiber); no digital UI or synthetic glow.",
+    "Keep all pixels outside the mask identical.",
+    `Include a tiny, subtle justification printed/handwritten near the insert: "${shortJust()}".`
+  ].join(" ");
+}
+
+
 
 // ---- IndexedDB tiny wrapper for image blobs ----
 const DB_NAME = "collageDB";
@@ -834,12 +892,29 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
   const box = regionBoxFromCell(region, canvas.width, canvas.height);
   const maskDataURL = createRegionMask(canvas, box);
 
+  statusEl.textContent = "Analyzing subject…";
+  let theme = { caption: "", keywords: [] };
+  try {
+    // smaller upload for describe
+    theme = await describeImageViaWorker(canvas.toDataURL("image/jpeg", 0.92));
+  } catch (e) {
+    console.warn("Describe failed, continuing with generic theme.", e);
+  }
+
+  const insertText = chooseSpecificInsert(theme.keywords, getThemeHint());
+  const instruction = buildQwenInstructionSpecific(
+    lastAnalysis,
+    lastRecommendations,
+    theme,
+    insertText
+  );
+
   statusEl.textContent = "Editing via Qwen…";
   try {
     const url = await editWithQwen(
       canvas.toDataURL("image/png"),
-      buildQwenInstruction(lastRecommendations, lastAnalysis, getThemeHint()),
-      maskDataURL // <- pass mask
+      instruction,
+      maskDataURL
     );
 
     const edited = new Image();
@@ -847,8 +922,7 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
     edited.onload = async () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
-
-      drawJustificationOnCanvas(shortJust(), lastAnalysis?.suggested_region);
+      drawJustificationOnCanvas(shortJust(), region);
       statusEl.textContent = "Done.";
       await captureEdited();
     };
@@ -864,6 +938,7 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
     await captureEdited();
   }
 });
+
 
 
 async function editWithQwen(imageDataURL, instruction, maskDataURL) {

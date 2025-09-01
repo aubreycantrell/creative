@@ -79,8 +79,9 @@ export async function onRequestOptions({ request }) {
         : {};
   
       // Case A: immediate image(s)
-      if (submitJson?.images?.length) {
-        return cors(200, { url: submitJson.images[0].url });
+      const directUrl = submitJson?.images?.[0]?.url || submitJson?.image?.url;
+      if (directUrl) {
+        return cors(200, { url: directUrl });
       }
   
       // Case B: queued, poll with request_id

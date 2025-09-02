@@ -1,11 +1,13 @@
 /* Serverless collage analyzer — runs fully in-browser (GitHub Pages / Cloudflare Pages friendly) */
 
+/* ============ CONFIG ============ */
 // If you don't have a diffusion worker yet, keep this null.
 const DIFFUSION_URL = null; // 'https://<YOUR-WORKER>.workers.dev'
-// top of file
 const API_BASE = 'https://collage-proxy.ac138.workers.dev';
+const HISTORY_KEY = "collage_history_v2"; // new structure
+const MAX_HISTORY = 20; // prune oldest beyond this
 
-
+/* ============ DOM ============ */
 const fileInput = document.getElementById("fileInput");
 const analyzeBtn = document.getElementById("analyzeBtn");
 const directBtn = document.getElementById("directBtn");
@@ -17,90 +19,40 @@ const skipBtn = document.getElementById("skipBtn");
 const downloadCsvBtn = document.getElementById("downloadCsvBtn");
 const statusEl = document.getElementById("status");
 const historyGrid = document.getElementById("historyGrid");
+const captionEl = document.getElementById("caption"); // optional (safe if missing)
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
-const MAX_HISTORY = 20; // prune oldest beyond this
-let currentEntry = null;
 
-
-
+/* ============ STATE ============ */
 let srcImage = null;
 let lastAnalysis = null;
 let lastRecommendations = null;
 let lastReasons = null;
+let currentEntry = null;
 let logRows = [["timestamp","user_decision","prompts","internal_explanations"]];
-const HISTORY_KEY = "collage_history_v2"; // new structure
 
-/* ---------- helpers ---------- */
+/* ============ HELPERS ============ */
 function on(id, evt, handler) {
   const el = document.getElementById(id);
   if (el) el.addEventListener(evt, handler);
   else console.warn(`Missing #${id} in DOM, skipped ${evt} binding`);
 }
 
-// --- Describe → choose a concrete insert ---
-
-async function describeImageViaWorker(imageDataURL) {
-  const res = await fetch(`${API_BASE}/describe`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ imageDataURL })
-  });
-  const j = await res.json();
-  if (j.error) throw new Error(j.error);
-  return { caption: j.caption || "", keywords: Array.isArray(j.keywords) ? j.keywords : [] };
+function setCaption(text) {
+  if (!captionEl) return;
+  captionEl.textContent = text || "";
+  captionEl.style.display = text ? "block" : "none";
 }
 
-// Keyword → specific artifact catalog
-const SPEC_INSERT_CATALOG = [
-  { key: ["flower","garden","plant","leaf","botanical"], insert: "a vintage seed packet label with a small botanical illustration and price mark" },
-  { key: ["beach","ocean","sea","surf","coast","sand"], insert: "a torn postcard corner with a postal cancellation stamp and a few handwritten words" },
-  { key: ["city","street","building","architecture","urban","bridge","car","traffic","train","subway","bus"], insert: "a small map fragment with a street grid and a circled intersection" },
-  { key: ["music","concert","piano","guitar","violin","band","orchestra","notes"], insert: "a narrow strip of aged sheet music with a tempo marking" },
-  { key: ["ticket","museum","event","theater","cinema","railway"], insert: "a perforated ticket stub with serial numbers" },
-  { key: ["bird","animal","wildlife","dog","cat","horse","fish","insect"], insert: "an encyclopedia clipping of a small animal engraving with its Latin name" },
-  { key: ["food","cafe","kitchen","fruit","bread","coffee","restaurant"], insert: "a grocery price tag or receipt sliver with an item name" },
-  { key: ["travel","airplane","airport","passport","luggage","road","map"], insert: "a vintage luggage label or baggage tag with a bold IATA code" },
-  { key: ["sports","soccer","football","basketball","baseball","tennis","stadium"], insert: "a ticket corner or scoreboard snippet with a date" },
-  { key: ["*"], insert: "a small diagram label or index tab that references the scene" }, // fallback
-];
-
-function chooseSpecificInsert(keywords = [], themeHint = "") {
-  const kw = new Set(keywords.map(k => (k || "").toLowerCase()));
-  let row = SPEC_INSERT_CATALOG.find(r => r.key.some(k => k !== "*" && kw.has(k)));
-  if (!row && themeHint) {
-    const th = themeHint.toLowerCase();
-    row = SPEC_INSERT_CATALOG.find(r => r.key.some(k => k !== "*" && th.includes(k)));
-  }
-  if (!row) row = SPEC_INSERT_CATALOG.find(r => r.key.includes("*"));
-  return row.insert;
+function getThemeHint() {
+  // optional: if you add a free-text <input id="themeHint"> in HTML
+  const el = document.getElementById("themeHint");
+  return el && el.value ? el.value.trim() : "";
 }
 
-// Build a specific Qwen instruction with the chosen insert
-function buildQwenInstructionSpecific(features, recs, theme, insertText) {
-  const region = features?.suggested_region || "center";
-  const mode = getCurrentMode();
-  const recText = (recs && recs[0] ? recs[0].replace(/\*\*/g, "") : "Add a small element");
-  const subject = getThemeHint() || theme?.caption || "the main subject";
-
-  return [
-    `${recText} in the ${region}.`,
-    regionToMaskNote(region),
-    profileDirective(mode),
-    `Insert specifically: ${insertText}. It must relate to "${subject}" yet introduce a contrasting visual idea to diversify the imagery.`,
-    paletteDirective(features),
-    "Materials must feel analog/scrapbook-ready (matte, cut edges, slight deckle/fiber); no digital UI or synthetic glow.",
-    "Keep all pixels outside the mask identical.",
-    `Include a tiny, subtle justification printed/handwritten near the insert: "${shortJust()}".`
-  ].join(" ");
-}
-
-
-
-// ---- IndexedDB tiny wrapper for image blobs ----
+/* ---- IndexedDB tiny wrapper for image blobs ---- */
 const DB_NAME = "collageDB";
 const STORE = "images";
-
 function idbOpen () {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, 1);
@@ -137,309 +89,7 @@ async function idbDelete(key) {
   });
 }
 
-function drawJustificationOnCanvas(text, region = "center") {
-  if (!text) return;
-  const W = canvas.width, H = canvas.height;
-
-  const anchors = {
-    "top left":[0.06,0.10], "top center":[0.50,0.10], "top right":[0.94,0.10],
-    "middle left":[0.06,0.50], "center":[0.50,0.50], "middle right":[0.94,0.50],
-    "bottom left":[0.06,0.90], "bottom center":[0.50,0.90], "bottom right":[0.94,0.90]
-  };
-  const [ax, ay] = anchors[region] || anchors["center"];
-  const x = Math.floor(W*ax), y = Math.floor(H*ay);
-
-  ctx.save();
-  ctx.font = `${Math.max(10, Math.floor(Math.min(W,H) * 0.018))}px sans-serif`;
-  ctx.textAlign = ax < 0.5 ? "left" : (ax > 0.5 ? "right" : "center");
-  ctx.textBaseline = "middle";
-
-  // subtle label: white box with faint border
-  const pad = 6;
-  const metrics = ctx.measureText(text);
-  const tw = Math.ceil(metrics.width) + pad*2;
-  const th = Math.ceil(parseInt(ctx.font,10)) + pad*1.2;
-
-  let bx = x - (ctx.textAlign === "center" ? tw/2 : (ctx.textAlign === "right" ? tw : 0));
-  let by = y - th/2;
-  bx = Math.max(4, Math.min(W - tw - 4, bx));
-  by = Math.max(4, Math.min(H - th - 4, by));
-
-  ctx.fillStyle = "rgba(255,255,255,0.85)";
-  ctx.fillRect(bx, by, tw, th);
-  ctx.strokeStyle = "rgba(0,0,0,0.25)";
-  ctx.strokeRect(bx + 0.5, by + 0.5, tw - 1, th - 1);
-  ctx.fillStyle = "#222";
-  ctx.fillText(text, bx + pad, by + th/2);
-  ctx.restore();
-}
-
-
-function getCurrentMode() {
-  return (document.getElementById("modeSelect")?.value || "collage");
-}
-
-function getThemeHint() {
-  // optional: if you add a free-text <input id="themeHint">
-  const el = document.getElementById("themeHint");
-  return el && el.value ? el.value.trim() : "";
-}
-
-// Profiles: materials + rendering intent per mode
-const ART_PROFILES = {
-  collage: {
-    materials: "analog, scrapbook-ready materials: torn/cut paper, patterned paper, newsprint/halftone, stickers, rubber-stamp marks, magazine/book clippings, photographic fragments, fabric or washi-tape swatches, matte adhesive/tape artifacts, abstract paper cutouts, printed ephemera",
-    surface: "matte paper, flatbed scanned / photographed on neutral background, hard cut edges or slight deckle/fiber"
-  },
-  drawing: {
-    materials: "graphite, charcoal, ink, technical pen linework, brush pen, colored pencil, marker",
-    surface: "tooth of paper visible, cross-hatching or gesture lines, no digital glow, natural hand jitter"
-  },
-  painting: {
-    materials: "gouache, acrylic, watercolor, oil pastel, ink washes",
-    surface: "visible brushstrokes, paper/canvas texture, pigment granulation (for watercolor), no CGI lighting"
-  },
-  print: {
-    materials: "photographic print scraps, contact sheet frames, photocopy toner, risograph textures, screenprint dots",
-    surface: "grain/toner noise, slight misregistration, halftone dots, paper edge wear"
-  },
-  mixed: {
-    materials: "hybrid analog: paper scraps, ink marks, paint swatches, photocopy textures, stamped letters, stitched or taped seams",
-    surface: "layered, imperfect edges, matte reflectance; cohesive physical artifact"
-  }
-};
-
-function profileDirective(mode) {
-  const p = ART_PROFILES[mode] || ART_PROFILES.collage;
-  return `Materials: ${p.materials}. Physical surface: ${p.surface}.`;
-}
-
-function paletteDirective(analysis) {
-  const { temperature = "neutral", colorfulness = 0, contrast = 0, entropy = 0 } = analysis || {};
-  const oppose = temperature === "cool"
-    ? "add a warm accent (yellow/red/orange) to counter cool dominance"
-    : "add a desaturated/toner-like accent to counter warm dominance";
-  const complexity = (contrast < 0.12 || entropy < 6.0)
-    ? "increase micro-contrast with crisp structure or distinct marks"
-    : "prefer semantic/typographic variety over more texture";
-  return `Palette/structure intent: ${oppose}; ${complexity}. Avoid synthetic glow or CGI lighting.`;
-}
-
-function regionToMaskNote(region = "center") {
-  return `Only modify the ${region} region; keep all other regions pixel-identical (no color or edge changes outside that area).`;
-}
-
-
-
-// Save a larger JPEG (to reduce quota) and a small thumbnail for the grid
-async function makeImagePairFromCanvas(cnv, maxW = 1600, thumbW = 260, quality = 0.92) {
-  // scale to maxW
-  const scale = Math.min(1, maxW / cnv.width);
-  const big = document.createElement("canvas");
-  big.width = Math.round(cnv.width * scale);
-  big.height = Math.round(cnv.height * scale);
-  big.getContext("2d").drawImage(cnv, 0, 0, big.width, big.height);
-
-  const full = big.toDataURL("image/jpeg", quality);
-
-  const thumbH = Math.round((cnv.height * thumbW) / cnv.width);
-  const thumb = document.createElement("canvas");
-  thumb.width = thumbW; thumb.height = thumbH;
-  thumb.getContext("2d").drawImage(cnv, 0, 0, thumbW, thumbH);
-  const thumbURL = thumb.toDataURL("image/jpeg", 0.8);
-
-  return { full, thumb: thumbURL };
-}
-
-// Render history grid (use thumbs only)
-function renderHistory() {
-  const list = readHistory();
-  historyGrid.innerHTML = "";
-  list.slice().reverse().forEach(item => {
-    const img = document.createElement("img");
-    img.src = (item.edited?.thumb || item.original?.thumb);
-    img.alt = "history";
-    img.className = "thumb";
-    historyGrid.appendChild(img);
-  });
-}
-
-
-async function captureOriginal() {
-  if (!srcImage) return; // nothing loaded yet
-
-  // Make full + thumb from the canvas
-  const pair = await makeImagePairFromCanvas(canvas);
-  const fullBlob = await (await fetch(pair.full)).blob();
-
-  // Store the full image in IndexedDB, keep the thumb in local history
-  const ref = crypto.randomUUID();
-  await idbPut(ref, fullBlob);
-
-  // Build the history entry
-  currentEntry = {
-    ts: new Date().toISOString(),
-    mode: (typeof getCurrentMode === "function" ? getCurrentMode() : "collage"),
-    features: lastAnalysis || null,
-    recs: lastRecommendations || [],
-    original: { ref, thumb: pair.thumb },
-    edited: null
-  };
-
-  const list = readHistory();
-  list.push(currentEntry);
-  await writeHistory(list);
-  renderHistory();
-}
-
-
-async function captureEdited() {
-  if (!currentEntry) return;
-  const pair = await makeImagePairFromCanvas(canvas);
-  const fullBlob = await (await fetch(pair.full)).blob();
-  const ref = crypto.randomUUID();
-
-  await idbPut(ref, fullBlob);
-
-  currentEntry.edited = { ref, thumb: pair.thumb };
-  const list = readHistory();
-  list[list.length - 1] = currentEntry;
-  await writeHistory(list);
-  renderHistory();
-}
-
-// Each entry: { ts, mode, features, recs, original: {full, thumb}, edited: {full, thumb} }
-function readHistory() {
-  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); }
-  catch { return []; }
-}
-
-async function writeHistory(list) {
-  // prune if too long (also delete associated blobs)
-  while (list.length > MAX_HISTORY) {
-    const removed = list.shift();
-    try {
-      if (removed?.original?.ref) await idbDelete(removed.original.ref);
-      if (removed?.edited?.ref) await idbDelete(removed.edited.ref);
-    } catch(_) {}
-  }
-  const json = JSON.stringify(list);
-  try {
-    localStorage.setItem(HISTORY_KEY, json);
-  } catch (e) {
-    // fallback to sessionStorage if localStorage full
-    try { sessionStorage.setItem(HISTORY_KEY, json); }
-    catch (ee) { console.error("Both localStorage and sessionStorage are full", ee); }
-  }
-}
-
-
-
-// --- Collage generation guidance ---
-const MATERIAL_WHITELIST =
-  "only scrapbook-ready, analog-feeling materials: torn or cut paper scraps, patterned paper, newsprint/halftone textures, stickers, rubber-stamp marks, magazine/book clippings, photographic fragments, fabric or washi-tape swatches, painted or inked marks, abstract paper cutouts, adhesive/tape artifacts, and other printed ephemera. No 3D objects, no CGI, no glossy renders.";
-
-function regionToMaskNote(region = "center") {
-  return `Only modify the ${region} region. Keep all other regions pixel-identical (do not alter composition, color, or edges outside that region).`;
-}
-
-function paletteDirective(analysis) {
-  const { temperature = "neutral", colorfulness = 0, contrast = 0, entropy = 0 } = analysis || {};
-  const oppose = temperature === "cool"
-    ? "inject a subtle warm accent (yellows/reds/orange) to oppose coolness"
-    : "inject a desaturated/photocopy-like accent to oppose warmth";
-  const complexity = (contrast < 0.12 || entropy < 6.0)
-    ? "add crisp, high-contrast micro-structure"
-    : "prefer typographic/graphic variety over more texture";
-  return `Palette/texture intent: ${oppose}; ${complexity}. Match paper-like reflectance (matte), avoid glow/lighting effects.`;
-}
-
-/**
- * Build a Qwen edit instruction that:
- * - uses recommended region
- * - encourages thematic-but-diverse scrap elements
- * - constrains materials to scrapbook-friendly analog media
- * - asks for a one-sentence justification to be embedded subtly on the element (tiny pencil note or stamp)
- */
-function buildQwenInstruction(recs, analysis, themeHint = "") {
-  const region = analysis?.suggested_region || "center";
-  const recText = (recs && recs.length ? recs[0] : "Add a small collage element")  // take top rec
-    .replace(/\*\*/g, ""); // strip markdown bold if present
-
-  const themeLine = themeHint
-    ? `The new element should be thematically related to: "${themeHint}", but introduce a contrasting visual idea for creative diversity.`
-    : `Make the new element thematically related to the main subject of the photo (infer from visible content), but introduce a contrasting visual idea for creative diversity.`;
-
-  return [
-    `${recText} in the ${region}.`,
-    regionToMaskNote(region),
-    `Materials: ${MATERIAL_WHITELIST}`,
-    themeLine,
-    paletteDirective(analysis),
-    "Physical believability: hard cut-paper edges, slight deckle or fiber, matte surface; photographed/flat-scanned look; no drop shadows that imply 3D lighting.",
-    "Typography/images must look sourced from print (magazine, book, ticket, label) or handmade stamps/marks—no digital UI or screens.",
-    "Include a tiny, subtle one-sentence justification printed/handwritten on the added piece (e.g., a marginalia note or stamp) that explains why this insertion increases tension/variety; keep it legible but understated.",
-  ].join(" ");
-}
-
-
-function regionBoxFromCell(regionName, W, H) {
-  // box ~45% x 25% centered on anchor, matches your overlay sizing
-  const anchors = {
-    "top left":[0.05,0.08], "top center":[0.35,0.08], "top right":[0.65,0.08],
-    "middle left":[0.05,0.38], "center":[0.35,0.38], "middle right":[0.65,0.38],
-    "bottom left":[0.05,0.68], "bottom center":[0.35,0.68], "bottom right":[0.65,0.68]
-  };
-  const [ax, ay] = anchors[regionName] || [0.35, 0.38];
-  const w = Math.floor(W * 0.45);
-  const h = Math.floor(H * 0.25);
-  let x = Math.floor(W * ax - w/2);
-  let y = Math.floor(H * ay - h/2);
-  x = Math.max(0, Math.min(W - w, x));
-  y = Math.max(0, Math.min(H - h, y));
-  return { x, y, w, h };
-}
-
-function createRegionMask(canvas, box) {
-  // White (edit) inside box, black (protect) elsewhere — common convention.
-  const m = document.createElement("canvas");
-  m.width = canvas.width; m.height = canvas.height;
-  const g = m.getContext("2d");
-  g.fillStyle = "#000"; g.fillRect(0,0,m.width,m.height);
-  g.fillStyle = "#fff"; g.fillRect(box.x, box.y, box.w, box.h);
-  return m.toDataURL("image/png");
-}
-
-function colorAccentFromAnalysis(features) {
-  // keep it simple & tangible for paper media
-  return (features?.temperature === "cool")
-    ? "use a warm accent (red/orange/yellow paper)"
-    : "use a cool accent (cyan/teal/blue paper)";
-}
-
-function themeCuePrompt() {
-  // lightweight generic guidance—lets the model infer relevance from the photo
-  return "choose motifs that are thematically relevant to the main subject (e.g., flowers → seed packet stamp; travel/city → ticket stub or map sliver; beach → torn postcard; portrait → name label or barcode)";
-}
-
-
-function buildHumanJustification(features, reasons, regionName) {
-  const lines = [];
-  lines.push(`Placement: ${regionName} (emptiest grid cell).`);
-  if (features) {
-    lines.push(`Palette: ${features.temperature} image → add ${colorAccentFromAnalysis(features).replace('use ', '')}.`);
-  }
-  (reasons || []).forEach(r => lines.push(`Why: ${r}`));
-  lines.push("Theme: element should reference the photo’s subject (e.g., map/ticket/seed packet/etc.), so it feels intentionally scrapbooked.");
-  return lines.join(" ");
-}
-
-function shortJust() {
-  const region = lastAnalysis?.suggested_region || "center";
-  return (buildHumanJustification(lastAnalysis, lastReasons, region) || "").slice(0, 140);
-}
-
-
+/* ============ ANALYSIS UTILS ============ */
 async function createBitmapFromBlob(blob) {
   if ('createImageBitmap' in window) {
     try { return await createImageBitmap(blob); } catch (_) {}
@@ -454,78 +104,6 @@ async function createBitmapFromBlob(blob) {
   });
 }
 
-function whiteToTransparent(bitmap, thr = 242) {
-  const c = document.createElement("canvas");
-  c.width = bitmap.width; c.height = bitmap.height;
-  const p = c.getContext("2d");
-  p.drawImage(bitmap, 0, 0);
-  const d = p.getImageData(0,0,c.width,c.height);
-  const a = d.data;
-  for (let i=0;i<a.length;i+=4){
-    const r=a[i], g=a[i+1], b=a[i+2];
-    if (r>=thr && g>=thr && b>=thr) a[i+3]=0;
-  }
-  p.putImageData(d,0,0);
-  return c;
-}
-
-function promptFromRecs(features, recs) {
-  const base = (recs||[]).join(" ; ");
-  const temp = features?.temperature || "neutral";
-  return `${base}. collage paper cut-out, torn edges, matte texture, photographed on plain white background, hard crisp silhouette, ${temp} palette accent, no drop shadow, high contrast`;
-}
-
-async function fetchDiffusionPNG(prompt, w=512, h=384) {
-  if (!DIFFUSION_URL) throw new Error("No diffusion URL configured");
-  const r = await fetch(DIFFUSION_URL, {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({ prompt, width: w, height: h, steps: 6, guidance: 1.0 })
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return await r.blob();
-}
-
-/* ---------- core UI flow ---------- */
-
-function loadImageToCanvas(file) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const maxW = 1200;
-      const scale = Math.min(1, maxW / img.width);
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      URL.revokeObjectURL(url);
-      srcImage = img;
-      downloadPngBtn.disabled = false;
-      resolve();
-    };
-    img.onerror = reject;
-    img.src = url;
-  });
-}
-
-fileInput.addEventListener("change", async () => {
-  const f = fileInput.files?.[0];
-  if (!f) return;
-  await loadImageToCanvas(f);
-  clearOutputs();
-});
-
-function clearOutputs() {
-  featuresEl.innerHTML = "";
-  recsEl.innerHTML = "";
-  statusEl.textContent = "";
-  lastAnalysis = null;
-  lastRecommendations = null;
-  lastReasons = null;
-}
-
-/* ---------- analysis (features) ---------- */
 function getImageData() { return ctx.getImageData(0, 0, canvas.width, canvas.height); }
 function toGray(imgData) {
   const { data, width, height } = imgData;
@@ -548,133 +126,116 @@ function gridOccupancy(img, gray, grad, rows=3, cols=3){const w=img.width,h=img.
 function topKEmptiest(masses,k=3){const flat=[];for(let i=0;i<masses.length;i++)for(let j=0;j<masses[i].length;j++)flat.push({i,j,score:masses[i][j]});flat.sort((a,b)=>a.score-b.score);return flat.slice(0,k);}
 function cellName(i,j){const names=[["top left","top center","top right"],["middle left","center","middle right"],["bottom left","bottom center","bottom right"]];return names[Math.max(0,Math.min(2,i))][Math.max(0,Math.min(2,j))];}
 
-/* ---------- recommendation logic ---------- */
-/* ---------- recommendation library ---------- */
+/* ============ RECOMMENDATION LIB ============ */
 const LIB = {
   "newsprint halftone dot field": {
     type: "pattern",
-    fmt: where =>
-      `Lay a **newsprint halftone dot field** as a translucent sheet across the ${where}, letting dots clash with your smooth areas.`,
+    fmt: where => `Lay a **newsprint halftone dot field** as a translucent sheet across the ${where}, letting dots clash with your smooth areas.`,
     why: "Introduce mechanical texture to disrupt soft gradients / uniform fills."
   },
   "checkerboard strip": {
     type: "pattern",
-    fmt: (where, dir) =>
-      `Tape a **thin checkerboard strip** running ${dir} through the ${where}, slightly misaligned.`,
+    fmt: (where, dir) => `Tape a **thin checkerboard strip** running ${dir} through the ${where}, slightly misaligned.`,
     why: "High-contrast, regular checkers oppose blended/low-contrast zones."
   },
   "CMY misregistration swatch": {
     type: "pattern",
-    fmt: where =>
-      `Add a **CMY misregistration swatch** (cyan/magenta/yellow blocks) in the ${where}, offset 2–4px per channel.`,
+    fmt: where => `Add a **CMY misregistration swatch** (cyan/magenta/yellow blocks) in the ${where}, offset 2–4px per channel.`,
     why: "Printers’ marks add industrial color conflict against cohesive palettes."
   },
   "ransom-letter typography": {
     type: "concept",
-    fmt: where =>
-      `Collage a **ransom-letter word** from mismatched magazines across the ${where}.`,
+    fmt: where => `Collage a **ransom-letter word** from mismatched magazines across the ${where}.`,
     why: "Mixed fonts/forms fracture typographic cohesion and inject narrative tension."
   },
   "found map fragment": {
     type: "concept",
-    fmt: where =>
-      `Glue a **small torn map fragment** into the ${where} with a hard edge crossing your calm area.`,
+    fmt: where => `Glue a **small torn map fragment** into the ${where} with a hard edge crossing your calm area.`,
     why: "Cartographic lines disrupt organic imagery; a ‘place’ reference counters abstraction."
   },
   "barcode/receipt sliver": {
     type: "concept",
-    fmt: where =>
-      `Slip a **barcode or receipt sliver** into the ${where}, slightly tilted.`,
+    fmt: where => `Slip a **barcode or receipt sliver** into the ${where}, slightly tilted.`,
     why: "Commodity marks oppose hand-made continuity and draw crisp verticals."
   },
   "torn paper diagonal": {
     type: "occurrence",
-    fmt: where =>
-      `Tear a **paper diagonal** from corner to corner through the ${where}; let the deckle edge show.`,
+    fmt: where => `Tear a **paper diagonal** from corner to corner through the ${where}; let the deckle edge show.`,
     why: "Jagged tear adds directional energy and interrupts symmetry."
   },
   "masking tape X": {
     type: "occurrence",
-    fmt: where =>
-      `Place a **masking-tape X** over the ${where}; leave a slight shadow gap.`,
+    fmt: where => `Place a **masking-tape X** over the ${where}; leave a slight shadow gap.`,
     why: "Tape reads provisional; the X symbolically ‘cancels’ cohesion."
   },
   "photocopy overlay": {
     type: "occurrence",
-    fmt: where =>
-      `Overlay a **high-contrast photocopy** rectangle in the ${where}, 5–10° rotated.`,
+    fmt: where => `Overlay a **high-contrast photocopy** rectangle in the ${where}, 5–10° rotated.`,
     why: "Brittle, desaturated toner fights saturated blends; rotation breaks alignment."
   }
 };
-
 function randomDirection() {
   return ["diagonally", "vertically", "horizontally"][Math.floor(Math.random() * 3)];
 }
 
-/* ---------- recommendation logic ---------- */
+/* ============ RECOMMENDATION LOGIC ============ */
 function opposeCohesion(features) {
   if (!features) return { recs: [], reasons: [] };
+  const recs = [], reasons = [];
 
-  const recs = [];
-  const reasons = [];
-
-  const temp = features.temperature;           // "warm" | "cool"
-  const cf   = features.colorfulness;          // number
-  const cont = features.contrast;              // number (0..~0.5)
-  const edges= features.edge_density;          // 0..1
-  const ent  = features.entropy;               // ~0..8
+  const temp = features.temperature;
+  const cf   = features.colorfulness;
+  const cont = features.contrast;
+  const edges= features.edge_density;
+  const ent  = features.entropy;
   const region = features.suggested_region || "center";
 
   // 1) Color temperature opposition
   if (temp === "cool") {
     const R = LIB["CMY misregistration swatch"];
     recs.push(R.fmt(region));
-    reasons.push(
-      `Image skews cool; add warm-biased CMY blocks and misregistration to create chroma conflict near ${region}.`
-    );
+    reasons.push(`Image skews cool; add warm-biased CMY blocks and misregistration to create chroma conflict near ${region}.`);
   } else {
     const R = LIB["photocopy overlay"];
     recs.push(R.fmt(region));
-    reasons.push(
-      `Image reads warm/saturated (colorfulness=${cf.toFixed(1)}); a desaturated photocopy slab opposes palette unity.`
-    );
+    reasons.push(`Image reads warm/saturated (colorfulness=${cf.toFixed(1)}); a desaturated photocopy slab opposes palette unity.`);
   }
 
   // 2) Texture / edge presence
   if (edges < 0.06) {
     const R = LIB["newsprint halftone dot field"];
     recs.push(R.fmt(region));
-    reasons.push(
-      `Edge density is low (${edges.toFixed(3)}); halftone dots add micro-structure and noise.`
-    );
+    reasons.push(`Edge density is low (${edges.toFixed(3)}); halftone dots add micro-structure and noise.`);
   } else {
     const R = LIB["masking tape X"];
     recs.push(R.fmt(region));
-    reasons.push(
-      `Edges already active (${edges.toFixed(3)}); a bold tape ‘X’ creates symbolic interruption instead.`
-    );
+    reasons.push(`Edges already active (${edges.toFixed(3)}); a bold tape ‘X’ creates symbolic interruption instead.`);
   }
 
   // 3) Contrast / complexity
   if (cont < 0.12 || ent < 6.0) {
     const R = LIB["checkerboard strip"];
     recs.push(R.fmt(region, randomDirection()));
-    reasons.push(
-      `Contrast=${cont.toFixed(2)}, entropy=${ent.toFixed(2)}; a crisp checker strip injects periodic contrast.`
-    );
+    reasons.push(`Contrast=${cont.toFixed(2)}, entropy=${ent.toFixed(2)}; a crisp checker strip injects periodic contrast.`);
   } else {
     const R = LIB["ransom-letter typography"];
     recs.push(R.fmt(region));
-    reasons.push(
-      `High image complexity (entropy=${ent.toFixed(2)}); mixed-letter typography shifts attention and breaks semantic cohesion.`
-    );
+    reasons.push(`High image complexity (entropy=${ent.toFixed(2)}); mixed-letter typography shifts attention and breaks semantic cohesion.`);
   }
 
   return { recs, reasons };
 }
 
-/* ---------- overlay drawing ---------- */
-function getOverlayKindFromRecs(recs=[]){const t=recs.join(" ").toLowerCase();if(t.includes("halftone"))return"halftone";if(t.includes("checker"))return"checker";if(t.includes("misregistration")||t.includes("cmy"))return"cmy";if(t.includes("masking-tape")||t.includes("tape x")||t.includes("masking"))return"tapex";if(t.includes("photocopy"))return"photocopy";return"checker";}
+/* ============ OVERLAY SYNTH ============ */
+function getOverlayKindFromRecs(recs=[]){
+  const t=recs.join(" ").toLowerCase();
+  if(t.includes("halftone"))return"halftone";
+  if(t.includes("checker"))return"checker";
+  if(t.includes("misregistration")||t.includes("cmy"))return"cmy";
+  if(t.includes("masking-tape")||t.includes("tape x")||t.includes("masking"))return"tapex";
+  if(t.includes("photocopy"))return"photocopy";
+  return"checker";
+}
 function buildOverlayPatch(kind, w, h) {
   const patch = document.createElement("canvas");
   patch.width = w; patch.height = h;
@@ -715,14 +276,11 @@ function buildOverlayPatch(kind, w, h) {
     const pad = Math.floor(w * 0.05);
     const bw = Math.floor((w - 3 * pad) / 3);
     const bh = Math.floor(h - 2 * pad);
-    const off = () => Math.floor((Math.random() * 6) - 3); // -3..+3 px
+    const off = () => Math.floor((Math.random() * 6) - 3);
     p.globalAlpha = 0.7;
-    p.fillStyle = "rgb(0,255,255)";
-    p.fillRect(pad + off(), pad + off(), bw, bh);
-    p.fillStyle = "rgb(255,0,255)";
-    p.fillRect(pad + bw + pad + off(), pad + off(), bw, bh);
-    p.fillStyle = "rgb(255,255,0)";
-    p.fillRect(pad + 2 * (bw + pad) + off(), pad + off(), bw, bh);
+    p.fillStyle = "rgb(0,255,255)";  p.fillRect(pad + off(), pad + off(), bw, bh);
+    p.fillStyle = "rgb(255,0,255)";  p.fillRect(pad + bw + pad + off(), pad + off(), bw, bh);
+    p.fillStyle = "rgb(255,255,0)";  p.fillRect(pad + 2 * (bw + pad) + off(), pad + off(), bw, bh);
     p.globalAlpha = 1.0;
   }
 
@@ -732,7 +290,6 @@ function buildOverlayPatch(kind, w, h) {
       p.translate(x, y); p.rotate(rot);
       p.fillStyle = `rgba(245,230,180,${alpha})`;
       p.fillRect(0, -th / 2, len, th);
-      // add little speckles to feel papery
       for (let i = 0; i < Math.floor(len * th * 0.01); i++) {
         p.fillStyle = "rgba(200,185,140,0.2)";
         p.fillRect(Math.random() * len - 0.5, (Math.random() - 0.5) * th, 1, 1);
@@ -747,8 +304,7 @@ function buildOverlayPatch(kind, w, h) {
   }
 
   if (kind === "photocopy") {
-    p.fillStyle = "#f8f8f8";
-    p.fillRect(0, 0, w, h);
+    p.fillStyle = "#f8f8f8"; p.fillRect(0, 0, w, h);
     for (let y = 0; y < h; y += 2) {
       p.fillStyle = Math.random() < 0.5 ? "rgba(0,0,0,0.1)" : "rgba(0,0,0,0.03)";
       p.fillRect(0, y, w, 1);
@@ -758,14 +314,12 @@ function buildOverlayPatch(kind, w, h) {
       p.fillRect(Math.random() * w, Math.random() * h, 1, 1);
     }
     p.strokeStyle = "rgba(0,0,0,0.8)";
-    p.lineWidth = 2;
-    p.strokeRect(1, 1, w - 2, h - 2);
+    p.lineWidth = 2; p.strokeRect(1, 1, w - 2, h - 2);
     p.globalAlpha = 0.85;
   }
 
   return patch;
 }
-
 function applySyntheticOverlay(){
   const region=lastAnalysis?.suggested_region||"center";
   const W=canvas.width,H=canvas.height;
@@ -779,11 +333,74 @@ function applySyntheticOverlay(){
   x=Math.max(0,Math.min(W-w,x)); y=Math.max(0,Math.min(H-h,y));
   const rot=(Math.random()*12-6)*Math.PI/180;
   ctx.save(); ctx.translate(x+w/2,y+h/2); ctx.rotate(rot); ctx.drawImage(patch,-w/2,-h/2); ctx.restore();
-  drawJustificationOnCanvas(shortJust(), region);
-
+  setCaption(shortJust());
 }
 
-/* ---------- analyze + buttons ---------- */
+/* ============ PIPELINE ============ */
+function clearOutputs() {
+  featuresEl.innerHTML = "";
+  recsEl.innerHTML = "";
+  statusEl.textContent = "";
+  setCaption("");
+  lastAnalysis = null;
+  lastRecommendations = null;
+  lastReasons = null;
+}
+
+function loadImageToCanvas(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const maxW = 1200;
+      const scale = Math.min(1, maxW / img.width);
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      srcImage = img;
+      if (downloadPngBtn) downloadPngBtn.disabled = false;
+      resolve();
+    };
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+fileInput?.addEventListener("change", async () => {
+  const f = fileInput.files?.[0];
+  if (!f) return;
+  await loadImageToCanvas(f);
+  clearOutputs();
+});
+
+function renderFeatures(f){
+  featuresEl.innerHTML="";
+  const entries={
+    "temperature":f.temperature,
+    "colorfulness":f.colorfulness.toFixed(3),
+    "contrast":f.contrast.toFixed(3),
+    "edge_density":f.edge_density.toFixed(3),
+    "entropy":f.entropy.toFixed(3),
+    "suggested_region":f.suggested_region
+  };
+  Object.entries(entries).forEach(([k,v])=>{
+    const li=document.createElement("li");
+    li.textContent=`${k}: ${v}`;
+    featuresEl.appendChild(li);
+  });
+}
+function renderRecs(list){
+  recsEl.innerHTML="";
+  list.forEach(t=>{
+    const li=document.createElement("li");
+    li.innerHTML=t;
+    recsEl.appendChild(li);
+  });
+}
+
+/* ============ ANALYZE ============ */
 async function analyze(mode){
   if(!srcImage){alert("Choose an image first.");return;}
   const img=getImageData(); const gray=toGray(img); const grad=sobelGrad(gray);
@@ -799,14 +416,294 @@ async function analyze(mode){
   if(mode==="direct") applySyntheticOverlay();
 }
 
-function renderFeatures(f){featuresEl.innerHTML=""; const entries={"temperature":f.temperature,"colorfulness":f.colorfulness.toFixed(3),"contrast":f.contrast.toFixed(3),"edge_density":f.edge_density.toFixed(3),"entropy":f.entropy.toFixed(3),"suggested_region":f.suggested_region}; Object.entries(entries).forEach(([k,v])=>{const li=document.createElement("li"); li.textContent=`${k}: ${v}`; featuresEl.appendChild(li);});}
-function renderRecs(list){recsEl.innerHTML=""; list.forEach(t=>{const li=document.createElement("li"); li.innerHTML=t; recsEl.appendChild(li);});}
+/* ============ DIFFUSION (optional) ============ */
+function promptFromRecs(features, recs) {
+  const base = (recs||[]).join(" ; ");
+  const temp = features?.temperature || "neutral";
+  return `${base}. collage paper cut-out, torn edges, matte texture, photographed on plain white background, hard crisp silhouette, ${temp} palette accent, no drop shadow, high contrast`;
+}
+async function fetchDiffusionPNG(prompt, w=512, h=384) {
+  if (!DIFFUSION_URL) throw new Error("No diffusion URL configured");
+  const r = await fetch(DIFFUSION_URL, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ prompt, width: w, height: h, steps: 6, guidance: 1.0 })
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return await r.blob();
+}
+function whiteToTransparent(bitmap, thr = 242) {
+  const c = document.createElement("canvas");
+  c.width = bitmap.width; c.height = bitmap.height;
+  const p = c.getContext("2d");
+  p.drawImage(bitmap, 0, 0);
+  const d = p.getImageData(0,0,c.width,c.height);
+  const a = d.data;
+  for (let i=0;i<a.length;i+=4){
+    const r=a[i], g=a[i+1], b=a[i+2];
+    if (r>=thr && g>=thr && b>=thr) a[i+3]=0;
+  }
+  p.putImageData(d,0,0);
+  return c;
+}
 
-/* Diffusion button (optional) */
-async function applyDiffusionOverlay(){
-  const prompt=promptFromRecs(lastAnalysis,lastRecommendations);
+/* ============ HISTORY (thumbs in storage, full in IDB) ============ */
+async function makeImagePairFromCanvas(cnv, maxW = 1600, thumbW = 260, quality = 0.92) {
+  const scale = Math.min(1, maxW / cnv.width);
+  const big = document.createElement("canvas");
+  big.width = Math.round(cnv.width * scale);
+  big.height = Math.round(cnv.height * scale);
+  big.getContext("2d").drawImage(cnv, 0, 0, big.width, big.height);
+
+  const full = big.toDataURL("image/jpeg", quality);
+
+  const thumbH = Math.round((cnv.height * thumbW) / cnv.width);
+  const thumb = document.createElement("canvas");
+  thumb.width = thumbW; thumb.height = thumbH;
+  thumb.getContext("2d").drawImage(cnv, 0, 0, thumbW, thumbH);
+  const thumbURL = thumb.toDataURL("image/jpeg", 0.8);
+
+  return { full, thumb: thumbURL };
+}
+function renderHistory() {
+  const list = readHistory();
+  historyGrid.innerHTML = "";
+  list.slice().reverse().forEach(item => {
+    const img = document.createElement("img");
+    img.src = (item.edited?.thumb || item.original?.thumb);
+    img.alt = "history";
+    img.className = "thumb";
+    historyGrid.appendChild(img);
+  });
+}
+function readHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); }
+  catch { return []; }
+}
+async function writeHistory(list) {
+  while (list.length > MAX_HISTORY) {
+    const removed = list.shift();
+    try {
+      if (removed?.original?.ref) await idbDelete(removed.original.ref);
+      if (removed?.edited?.ref) await idbDelete(removed.edited.ref);
+    } catch(_) {}
+  }
+  const json = JSON.stringify(list);
+  try { localStorage.setItem(HISTORY_KEY, json); }
+  catch {
+    try { sessionStorage.setItem(HISTORY_KEY, json); }
+    catch (ee) { console.error("Both localStorage and sessionStorage are full", ee); }
+  }
+}
+async function captureOriginal() {
+  if (!srcImage) return;
+  const pair = await makeImagePairFromCanvas(canvas);
+  const fullBlob = await (await fetch(pair.full)).blob();
+  const ref = crypto.randomUUID();
+  await idbPut(ref, fullBlob);
+  currentEntry = {
+    ts: new Date().toISOString(),
+    mode: "auto",
+    features: lastAnalysis || null,
+    recs: lastRecommendations || [],
+    original: { ref, thumb: pair.thumb },
+    edited: null
+  };
+  const list = readHistory();
+  list.push(currentEntry);
+  await writeHistory(list);
+  renderHistory();
+}
+async function captureEdited() {
+  if (!currentEntry) return;
+  const pair = await makeImagePairFromCanvas(canvas);
+  const fullBlob = await (await fetch(pair.full)).blob();
+  const ref = crypto.randomUUID();
+  await idbPut(ref, fullBlob);
+  currentEntry.edited = { ref, thumb: pair.thumb };
+  const list = readHistory();
+  list[list.length - 1] = currentEntry;
+  await writeHistory(list);
+  renderHistory();
+}
+function shortJust() {
+  const region = lastAnalysis?.suggested_region || "center";
+  const lines = [];
+  lines.push(`Placement: ${region} (emptiest grid cell).`);
+  if (lastAnalysis) {
+    const isCool = lastAnalysis.temperature === "cool";
+    lines.push(`Palette: ${lastAnalysis.temperature} → add ${isCool ? "warm" : "cool"} accent.`);
+  }
+  (lastReasons || []).forEach(r => lines.push(`Why: ${r}`));
+  lines.push("Theme: inserted element should be related to the subject yet add novelty.");
+  return lines.join(" ").slice(0, 140);
+}
+
+/* ============ AUTO MEDIUM INFERENCE ============ */
+function inferProfile(analysis) {
+  const { colorfulness=0, contrast=0, edge_density=0, entropy=0 } = analysis || {};
+  if (colorfulness > 45 && entropy > 6.2) return "painting";
+  if (edge_density > 0.09 && contrast > 0.14 && colorfulness < 35) return "drawing";
+  if (edge_density > 0.07 && entropy > 6.0) return "print";
+  if (contrast < 0.11 && entropy < 5.6) return "collage";
+  return "mixed";
+}
+const PROFILE_DIRECTIVES = {
+  collage:  "Use tangible paper ephemera, cut edges, matte surface.",
+  drawing:  "Use graphite/ink linework or hatching; paper tooth visible; no digital glow.",
+  painting: "Use brushstrokes (gouache/acrylic/watercolor) and pigment texture; matte.",
+  print:    "Use halftone/toner/grain; slight misregistration; photocopy/riso feel.",
+  mixed:    "Use a hybrid: paper scraps, stamped text, small paint/ink marks."
+};
+function profileDirectiveFromAnalysis(analysis){
+  const p = inferProfile(analysis);
+  return `Medium intent: ${PROFILE_DIRECTIVES[p]}`;
+}
+const MATERIAL_WHITELIST =
+  "only scrapbook-ready, analog-feeling materials: torn/cut paper scraps, patterned paper, newsprint/halftone, stickers, rubber-stamp marks, magazine/book clippings, photographic fragments, fabric/washi-tape swatches, painted/inked marks, abstract cutouts, adhesive/tape artifacts, printed ephemera.";
+function regionToMaskNote(region = "center") {
+  return `Only modify the ${region} region; keep all other regions pixel-identical.`;
+}
+function paletteDirective(analysis) {
+  const { temperature = "neutral", colorfulness = 0, contrast = 0, entropy = 0 } = analysis || {};
+  const oppose = temperature === "cool"
+    ? "add a warm accent (yellow/red/orange) to counter cool dominance"
+    : "add a desaturated/toner-like accent to counter warm dominance";
+  const complexity = (contrast < 0.12 || entropy < 6.0)
+    ? "increase micro-contrast with crisp structure"
+    : "prefer semantic/typographic variety over more texture";
+  return `Palette/structure intent: ${oppose}; ${complexity}. Avoid synthetic glow.`;
+}
+function regionBoxFromCell(regionName, W, H) {
+  const anchors = {
+    "top left":[0.05,0.08], "top center":[0.35,0.08], "top right":[0.65,0.08],
+    "middle left":[0.05,0.38], "center":[0.35,0.38], "middle right":[0.65,0.38],
+    "bottom left":[0.05,0.68], "bottom center":[0.35,0.68], "bottom right":[0.65,0.68]
+  };
+  const [ax, ay] = anchors[regionName] || [0.35, 0.38];
+  const w = Math.floor(W * 0.45);
+  const h = Math.floor(H * 0.25);
+  let x = Math.floor(W * ax - w/2);
+  let y = Math.floor(H * ay - h/2);
+  x = Math.max(0, Math.min(W - w, x));
+  y = Math.max(0, Math.min(H - h, y));
+  return { x, y, w, h };
+}
+function createRegionMask(canvas, box) {
+  const m = document.createElement("canvas");
+  m.width = canvas.width; m.height = canvas.height;
+  const g = m.getContext("2d");
+  g.fillStyle = "#000"; g.fillRect(0,0,m.width,m.height);
+  g.fillStyle = "#fff"; g.fillRect(box.x, box.y, box.w, box.h);
+  return m.toDataURL("image/png");
+}
+
+/* ============ THEMATIC DESCRIBE (optional) ============ */
+async function describeTheme(imageDataURL){
+  try {
+    const r = await fetch(`${API_BASE}/describe`, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ imageDataURL })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    // Accept either {theme} or {topic,motifs}
+    if (j.theme) return j.theme;
+    if (j.topic || (j.motifs && j.motifs.length)) {
+      return [j.topic, ...(j.motifs||[])].filter(Boolean).join(", ");
+    }
+  } catch (e) {
+    console.warn("Describe failed, continuing with generic theme.", e);
+  }
+  return "";
+}
+
+/* ============ QWEN PROMPT ============ */
+function buildQwenInstruction(recs, analysis, themeHint = "") {
+  const region = analysis?.suggested_region || "center";
+  const recText = (recs && recs.length ? recs[0] : "Add a small element").replace(/\*\*/g, "");
+
+  const themeLine = themeHint
+    ? `Infer the image’s subject, then insert a concrete, recognizable element thematically related to "${themeHint}" that also introduces novelty and diversity.`
+    : `Infer the main subject from the image, then insert a concrete, recognizable element that is thematically related yet introduces novelty and diversity.`;
+
+  return [
+    `${recText} in the ${region}.`,
+    regionToMaskNote(region),
+    profileDirectiveFromAnalysis(analysis),
+    "Use a specific item (e.g., seed packet, travel ticket, postage stamp, barcode strip, map fragment, emblem, small illustration) that fits the subject but adds a new twist.",
+    `Materials: ${MATERIAL_WHITELIST}`,
+    paletteDirective(analysis),
+    "Preserve physical believability (matte surface, cut edges / hatching / brush texture based on the inferred medium). No digital UI/screens or synthetic glows.",
+    "Keep all other regions pixel-identical to the original.",
+    "Add a tiny, subtle one-sentence justification on/near the inserted piece (marginalia/stamp). Keep it understated."
+  ].join(" ");
+}
+
+/* ============ NETWORK ACTIONS ============ */
+async function editWithQwen(imageDataURL, instruction, maskDataURL) {
+  const res = await fetch(`${API_BASE}/qwen-edit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      imageDataURL,
+      prompt: instruction,
+      maskDataURL,
+      steps: 28,
+      guidance: 4
+    })
+  });
+  const { url, error } = await res.json();
+  if (error) throw new Error(error);
+  return url;
+}
+
+/* ============ UI BUTTONS ============ */
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+on("downloadPngBtn", "click", async () => {
+  if (!canvas.width) return;
+  canvas.toBlob(b => b && downloadBlob(b, "collage.png"), "image/png");
+});
+
+on("saveCurrentBtn","click", async () => {
+  if (!currentEntry) { statusEl.textContent = "Nothing to save yet."; return; }
+  if (currentEntry.original?.ref) {
+    const b = await idbGet(currentEntry.original.ref);
+    if (b) downloadBlob(b, `original-${currentEntry.ts}.jpg`);
+  }
+  if (currentEntry.edited?.ref) {
+    const b = await idbGet(currentEntry.edited.ref);
+    if (b) downloadBlob(b, `edited-${currentEntry.ts}.jpg`);
+  }
+});
+
+on("analyzeBtn","click", async () => {
+  await analyze("general");
+  await captureOriginal();
+  setCaption(""); // clean until a suggestion is applied
+});
+
+on("directBtn","click", async () => {
+  await analyze("general");
+  await captureOriginal();
+  applySyntheticOverlay();
+  await captureEdited();
+});
+
+on("diffuseBtn","click", async () => {
+  if (!srcImage) { alert("Choose an image first."); return; }
+  await analyze("general");
+  await captureOriginal();
   statusEl.textContent="Generating diffusion overlay…";
   try{
+    const prompt=promptFromRecs(lastAnalysis,lastRecommendations);
     const targetW=Math.floor(canvas.width*0.45), targetH=Math.floor(canvas.height*0.25);
     const blob=await fetchDiffusionPNG(prompt,targetW,targetH);
     const bmp=await createBitmapFromBlob(blob);
@@ -820,110 +717,41 @@ async function applyDiffusionOverlay(){
     let x=Math.floor(W*ax+jx), y=Math.floor(H*ay+jy); x=Math.max(0,Math.min(W-rw,x)); y=Math.max(0,Math.min(H-rh,y));
     const rot=(Math.random()*12-6)*Math.PI/180; ctx.save(); ctx.translate(x+rw/2,y+rh/2); ctx.rotate(rot); ctx.drawImage(cut,-rw/2,-rh/2,rw,rh); ctx.restore();
     statusEl.textContent="Overlay added.";
-  }catch(e){console.warn("Diffusion failed, using local overlay:",e); statusEl.textContent="Diffusion unavailable—used local overlay."; applySyntheticOverlay();}
-}
-
-/* Logging + history */
-async function submitDecision(dec){ if(!lastRecommendations) return; const ts=new Date().toISOString(); logRows.push([ts,dec,lastRecommendations.join(" | "),(lastReasons||[]).join(" ; ")]); statusEl.textContent="Saved (in-memory). Use 'Download CSV Log' to export."; }
-acceptBtn.addEventListener("click",()=>submitDecision("accept"));
-skipBtn.addEventListener("click",()=>submitDecision("skip"));
-downloadCsvBtn.addEventListener("click",()=>{const csv=logRows.map(r=>r.map(v=>`"${(v+"").replace(/"/g,'""')}"`).join(",")).join("\n"); const blob=new Blob([csv],{type:"text/csv"}); const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download="interactions.csv"; a.click(); URL.revokeObjectURL(url);});
-
-
-
-
-// After analyze finished drawing (no overlay yet):
-
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
-}
-
-document.getElementById("saveCurrentBtn").addEventListener("click", async () => {
-  if (!currentEntry) { statusEl.textContent = "Nothing to save yet."; return; }
-  if (currentEntry.original?.ref) {
-    const b = await idbGet(currentEntry.original.ref);
-    if (b) downloadBlob(b, `original-${currentEntry.ts}.jpg`);
+    setCaption(shortJust());
+  }catch(e){
+    console.warn("Diffusion failed, using local overlay:",e);
+    statusEl.textContent="Diffusion unavailable—used local overlay.";
+    applySyntheticOverlay();
   }
-  if (currentEntry.edited?.ref) {
-    const b = await idbGet(currentEntry.edited.ref);
-    if (b) downloadBlob(b, `edited-${currentEntry.ts}.jpg`);
-  }
-});
-
-analyzeBtn.addEventListener("click", async () => {
-  await analyze("general");
-  await captureOriginal(); // <-- add this; single original snapshot
-});
-
-directBtn.addEventListener("click", async () => {
-  await analyze("general");
-  await captureOriginal();
-  applySyntheticOverlay();
-  drawJustificationOnCanvas(
-    "Local overlay adds structure/contrast in a low-activity region.",
-    lastAnalysis?.suggested_region
-  );
   await captureEdited();
 });
 
-// Diffusion:
-document.getElementById("diffuseBtn").addEventListener("click", async () => {
+on("qwenBtn","click", async () => {
   if (!srcImage) { alert("Choose an image first."); return; }
   await analyze("general");
   await captureOriginal();
-  await applyDiffusionOverlay();
-  drawJustificationOnCanvas(
-    "Warm/cool accent increases tension and variety per analysis.",
-    lastAnalysis?.suggested_region
-  );
-  await captureEdited();
-});
 
-// Qwen:
-document.getElementById("qwenBtn").addEventListener("click", async () => {
-  if (!srcImage) { alert("Choose an image first."); return; }
-  await analyze("general");
-  await captureOriginal();
+  // try to get thematic cue (optional)
+  const themeHint = getThemeHint() || await describeTheme(canvas.toDataURL("image/png"));
 
   const region = lastAnalysis?.suggested_region || "center";
   const box = regionBoxFromCell(region, canvas.width, canvas.height);
   const maskDataURL = createRegionMask(canvas, box);
 
-  statusEl.textContent = "Analyzing subject…";
-  let theme = { caption: "", keywords: [] };
-  try {
-    // smaller upload for describe
-    theme = await describeImageViaWorker(canvas.toDataURL("image/jpeg", 0.92));
-  } catch (e) {
-    console.warn("Describe failed, continuing with generic theme.", e);
-  }
-
-  const insertText = chooseSpecificInsert(theme.keywords, getThemeHint());
-  const instruction = buildQwenInstructionSpecific(
-    lastAnalysis,
-    lastRecommendations,
-    theme,
-    insertText
-  );
-
   statusEl.textContent = "Editing via Qwen…";
   try {
     const url = await editWithQwen(
       canvas.toDataURL("image/png"),
-      instruction,
+      buildQwenInstruction(lastRecommendations, lastAnalysis, themeHint),
       maskDataURL
     );
-
     const edited = new Image();
     edited.crossOrigin = "anonymous";
     edited.onload = async () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(edited, 0, 0, canvas.width, canvas.height);
-      drawJustificationOnCanvas(shortJust(), region);
       statusEl.textContent = "Done.";
+      setCaption(shortJust());
       await captureEdited();
     };
     edited.src = url;
@@ -931,35 +759,18 @@ document.getElementById("qwenBtn").addEventListener("click", async () => {
     console.warn(e);
     statusEl.textContent = "Qwen edit failed—using local overlay.";
     applySyntheticOverlay();
-    drawJustificationOnCanvas(
-      "Fallback overlay adds periodic contrast in the suggested region.",
-      region
-    );
     await captureEdited();
   }
 });
 
-
-
-async function editWithQwen(imageDataURL, instruction, maskDataURL) {
-  const res = await fetch(`${API_BASE}/qwen-edit`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      imageDataURL,
-      prompt: instruction,
-      maskDataURL,          // NEW (Worker may pass through as `mask`)
-      steps: 28,
-      guidance: 4
-    })
-  });
-  const { url, error } = await res.json();
-  if (error) throw new Error(error);
-  return url;
-}
-
-
-document.getElementById("clearHistoryBtn").addEventListener("click", () => {
+on("clearHistoryBtn","click", async () => {
+  const list = readHistory();
+  for (const item of list) {
+    try {
+      if (item?.original?.ref) await idbDelete(item.original.ref);
+      if (item?.edited?.ref) await idbDelete(item.edited.ref);
+    } catch(_) {}
+  }
   localStorage.removeItem(HISTORY_KEY);
   sessionStorage.removeItem(HISTORY_KEY);
   currentEntry = null;
@@ -967,7 +778,7 @@ document.getElementById("clearHistoryBtn").addEventListener("click", () => {
   statusEl.textContent = "History cleared (this device only).";
 });
 
-document.getElementById("downloadSessionBtn").addEventListener("click", () => {
+on("downloadSessionBtn","click", () => {
   const data = JSON.stringify(readHistory(), null, 2);
   const blob = new Blob([data], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -976,3 +787,21 @@ document.getElementById("downloadSessionBtn").addEventListener("click", () => {
   a.click(); URL.revokeObjectURL(url);
 });
 
+/* ============ ACCEPT/SKIP + CSV ============ */
+acceptBtn?.addEventListener("click",()=>submitDecision("accept"));
+skipBtn?.addEventListener("click",()=>submitDecision("skip"));
+downloadCsvBtn?.addEventListener("click",()=>{
+  const csv=logRows.map(r=>r.map(v=>`"${(v+"").replace(/"/g,'""')}"`).join(",")).join("\n");
+  const blob=new Blob([csv],{type:"text/csv"});
+  const url=URL.createObjectURL(blob); const a=document.createElement("a");
+  a.href=url; a.download="interactions.csv"; a.click(); URL.revokeObjectURL(url);
+});
+async function submitDecision(dec){
+  if(!lastRecommendations) return;
+  const ts=new Date().toISOString();
+  logRows.push([ts,dec,lastRecommendations.join(" | "),(lastReasons||[]).join(" ; ")]);
+  statusEl.textContent="Saved (in-memory). Use 'Download CSV Log' to export.";
+}
+
+/* ============ INIT ============ */
+renderHistory();
